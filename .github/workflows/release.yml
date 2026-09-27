@@ -5,7 +5,12 @@ on:
     tags: ["v*"]
 
 jobs:
+  ci:
+    # Reuse the complete matrix, semantic suite and Docker gate on this tag.
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +25,7 @@ jobs:
           path: dist/
 
   publish:
-    needs: build
+    needs: [ci, build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

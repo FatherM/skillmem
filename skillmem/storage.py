@@ -4,7 +4,7 @@ Full record provenance (birth certificate / supersession / death record)
 is built in:
 - created_at/updated_at and source_session = birth certificate
 - ttl_days + freshness_until = expiration
-- supersedes_id chain + memory_history table = death record
+- memory_history table = death record
 
 FTS5 mirrors title+body via triggers so writes stay simple.
 """
@@ -19,7 +19,7 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Any, Iterable, Iterator
 
@@ -53,10 +53,8 @@ _AWS_KEY = _re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
 _TG_BOT_TOKEN = _re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_\-]{32,}\b")
 _JWT = _re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")
 # password=... / "token": "..." / secret: ... — redact the value, keep the key name.
-# A value that is already a redaction marker is not a secret: without the
-# lookahead every re-write of a scrubbed body (dump restore, mem_update,
-# /update) grew "[secret redacted] redacted]", changed the content hash and
-# dropped the row's approval.
+# A redaction marker is not a secret: scrubbing a scrubbed body is a no-op, or
+# its hash (and approval) changed on every re-write.
 _SECRET_ASSIGN = _re.compile(
     r"""(?i)\b(password|passwd|pwd|secret|api[_\-]?key|token|access[_\-]?token)\b"""
     r"""(\s*[:=]\s*)(["']?)(?!\[[a-z\-]+ redacted\])([^\s"',;]{6,})(["']?)""",
@@ -64,10 +62,19 @@ _SECRET_ASSIGN = _re.compile(
 _WIKILINK = _re.compile(r"\[\[([^\]\n]+?)\]\]")
 
 
+def _absolute(path: str) -> Path:
+    """An override made absolute: a relative one written into a scheduled
+    job meant another database from the job's working directory (INV-12)."""
+    try:
+        return Path(path).expanduser().absolute()
+    except OSError:   # a vanished cwd: opening reports it
+        return Path(path).expanduser()
+
+
 def default_data_dir() -> Path:
     override = os.environ.get("SKILLMEM_HOME")
     if override:
-        return Path(override).expanduser()
+        return _absolute(override)
     return Path(user_data_dir(APP_NAME, appauthor=False))
 
 
@@ -75,7 +82,7 @@ def default_db_path() -> Path:
     """``SKILLMEM_DB`` wins over ``SKILLMEM_HOME`` wins over OS user-data."""
     db_override = os.environ.get("SKILLMEM_DB")
     if db_override:
-        return Path(db_override).expanduser()
+        return _absolute(db_override)
     return default_data_dir() / "memory.db"
 
 
@@ -86,17 +93,14 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     in :func:`tx` so they commit atomically. Anything else just runs in
     autocommit — keeps callers simple, no need to remember `.commit()`.
     """
-    path = Path(db_path) if db_path else default_db_path()
+    path = Path(db_path).expanduser() if db_path else default_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
-    # A fleet of agents writes through this DB concurrently. Without a busy
-    # timeout, a writer that meets a held lock fails instantly with
-    # "database is locked" instead of waiting the fraction of a second the
-    # other transaction needs. Override with SKILLMEM_BUSY_TIMEOUT_MS.
+    # concurrent writers wait for the lock instead of failing at once
     busy_ms = _env_int("SKILLMEM_BUSY_TIMEOUT_MS", 10_000)
     conn.execute(f"PRAGMA busy_timeout = {busy_ms}")
     return conn
@@ -115,32 +119,62 @@ def _env_int(name: str, default: int) -> int:
 
 import uuid as _uuid
 
+# Embeddings asked for inside a transaction, by connection: computed after the
+# outermost COMMIT, so the model never runs under the write lock.
+_deferred_embeddings: dict[int, list[tuple[Any, ...]]] = {}
+
 
 @contextmanager
 def tx(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Atomic write block. Re-entrant via SAVEPOINTs so nested ``with tx``
-    works (outer ``upsert`` inside a batch import loop, etc.)."""
+    """Atomic write block (BEGIN IMMEDIATE), re-entrant via SAVEPOINTs.
+    Embeddings requested inside it are computed after the outermost COMMIT,
+    so the model never runs under the write lock (INV-09)."""
     if conn.in_transaction:
         sp = "sm_sp_" + _uuid.uuid4().hex[:12]  # guaranteed unique name
         conn.execute(f"SAVEPOINT {sp}")
         try:
             yield conn
-        except Exception:
+            conn.execute(f"RELEASE {sp}")
+        except BaseException:
             conn.execute(f"ROLLBACK TO {sp}")
             conn.execute(f"RELEASE {sp}")
             raise
-        else:
-            conn.execute(f"RELEASE {sp}")
         return
 
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        # inside the try: a Ctrl-C while BEGIN waits for the lock is raised as
+        # it returns, and left the transaction open under every later write
+        conn.execute("BEGIN IMMEDIATE")
         yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
+        # COMMIT too (r16 review): one that failed kept the lock open
         conn.execute("COMMIT")
+        for args in _deferred_embeddings.pop(id(conn), []):
+            _set_embedding(conn, *args)
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        _deferred_embeddings.pop(id(conn), None)
+        raise
+
+
+@contextmanager
+def snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Several reads that see one committed state. A deferred BEGIN: in WAL
+    mode it neither takes nor waits for the write lock, so a long writer
+    elsewhere does not stall it (tx() would, for the whole busy timeout)."""
+    if conn.in_transaction:
+        yield conn
+        return
+    try:
+        conn.execute("BEGIN")     # inside the try, as in tx()
+        yield conn
+    finally:
+        try:
+            if conn.in_transaction:
+                conn.execute("COMMIT")
+        finally:
+            if conn.in_transaction:     # the COMMIT failed
+                conn.execute("ROLLBACK")
 
 
 # --------------------------------------------------------------------------- #
@@ -166,8 +200,8 @@ CREATE TABLE IF NOT EXISTS memory_items (
     freshness_until INTEGER,
     wordcount       INTEGER NOT NULL DEFAULT 0,
     content_hash    TEXT NOT NULL,
-    supersedes_id   INTEGER REFERENCES memory_items(id) ON DELETE SET NULL,
-    confidence      REAL NOT NULL DEFAULT 1.0,
+    supersedes_id   INTEGER REFERENCES memory_items(id) ON DELETE SET NULL, -- unused
+    confidence      REAL NOT NULL DEFAULT 1.0,     -- unused: no surface sets or reads it
     strength        REAL NOT NULL DEFAULT 1.0,
     pinned          INTEGER NOT NULL DEFAULT 0,    -- 1 = never decays, never archived (v9)
     confirmed_count INTEGER NOT NULL DEFAULT 0,    -- times an external signal confirmed it (v9)
@@ -220,16 +254,28 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
     """Idempotent schema bootstrap. Cheap on every call after first run."""
     conn.executescript(SCHEMA)
     _migrate(conn)
-    # No write here: _migrate records schema_version itself. An INSERT on every
-    # open took the write lock, so a hook opening the DB behind any writer
-    # stalled for the whole busy_timeout and then emitted nothing.
+    # Once per database, in one statement: a new one gets its id, one that
+    # already holds records keeps naming its files by path ("", _db_identity).
+    if conn.execute("SELECT 1 FROM meta WHERE key = 'db_id'").fetchone() is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) SELECT 'db_id', CASE WHEN "
+            "EXISTS (SELECT 1 FROM memory_items) THEN '' ELSE ? END",
+            (_uuid.uuid4().hex,))
+    # ... and the file it was given in: a byte copy carries the id (INV-12)
+    if _db_inode(conn) and conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'db_file'").fetchone() is None:
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('db_file', ?)",
+                     (_db_inode(conn),))
+    _adopt_body_files(conn)
+    # An open takes no write lock unless there is something to change: a hook
+    # opening behind any writer would stall for the whole busy_timeout.
 
 
 def _current_schema_version(conn: sqlite3.Connection) -> int:
@@ -244,15 +290,10 @@ def _current_schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def _add_column(conn: sqlite3.Connection, ddl: str) -> None:
-    """ALTER ... ADD COLUMN that tolerates losing the race to another process.
-
-    Two hooks opening a pre-v9 DB at once both saw the column missing and both
-    ALTERed; the loser died with "duplicate column name". v10 guarded this,
-    the older columns did not.
-    """
+def _add_column(conn: sqlite3.Connection, ddl: str, table: str = "memory_items") -> None:
+    """ALTER ... ADD COLUMN that tolerates losing the race to another opener."""
     try:
-        conn.execute(f"ALTER TABLE memory_items ADD COLUMN {ddl}")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
     except sqlite3.OperationalError as exc:
         if "duplicate column" not in str(exc).lower():
             raise
@@ -260,40 +301,55 @@ def _add_column(conn: sqlite3.Connection, ddl: str) -> None:
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Forward-only schema patches. Backfills run once, then are skipped."""
-    # Self-healing guard: ensure the embedding column exists regardless of the
-    # version gate below. A migration interrupted between bumping the version
-    # and running its ALTER (e.g. a concurrent recall hook) could otherwise
-    # strand the DB at v6 with no column. Cheap idempotent check on every open.
+    if _pre_v10(conn):
+        # the backup is the database before any repair, under the repairs' lock (INV-12)
+        with tx(conn):
+            if _pre_v10(conn):
+                _backup_before_v10(conn)
+            _heal(conn)
+    else:
+        _heal(conn)
+
+    if _current_schema_version(conn) >= CURRENT_SCHEMA_VERSION:
+        return
+    # one transaction, the version asked again under its lock (INV-05)
+    with tx(conn):
+        if _current_schema_version(conn) < CURRENT_SCHEMA_VERSION:
+            _migrate_versioned(conn)
+
+
+def _pre_v10(conn: sqlite3.Connection) -> bool:
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
+    return not {name for name, _ in _V10_COLUMNS} <= have
+
+
+def _heal(conn: sqlite3.Connection) -> None:
+    """The unversioned steps, checked on every open. Each reads first, so the
+    common case takes no write lock, and each UPDATE's WHERE re-states the read
+    (INV-05). A stored value upsert would refuse is repaired to the nearest one
+    it accepts, or the record's own dump would not restore (INV-06)."""
+    # columns guaranteed whatever the version says: an interrupted migration
+    # could strand a version without its ALTER
     live_cols = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
     if "embedding" not in live_cols:
         _add_column(conn, "embedding BLOB")
-    # v7: skill lifecycle state (active -> stale -> archived). Self-healing,
-    # like embedding, so the column is guaranteed regardless of the version gate.
     if "lifecycle" not in live_cols:
         _add_column(conn, "lifecycle TEXT NOT NULL DEFAULT 'active'")
-    # 0.11: one decay step per threshold (see decay_stale). Self-healing, like
-    # the columns above — the schema version does not move for it.
     if "last_decayed_at" not in live_cols:
         _add_column(conn, "last_decayed_at INTEGER")
-    # 0.11: kinds are normalised on write now; rows written before that as
-    # "Reference" would be invisible to a kind="reference" filter. Read first
-    # so the common case takes no write lock on open.
+    # kinds: every one with a character or a length _KIND_RE refuses, or a space to collapse
     odd = conn.execute(
-        "SELECT id, kind FROM memory_items WHERE kind != LOWER(TRIM(kind, ' \t\r\n')) "
-        "OR kind LIKE '%  %' OR kind LIKE '%' || char(9) || '%' "
-        "OR kind LIKE '%' || char(10) || '%' OR kind LIKE '%' || char(13) || '%' "
-        "OR kind LIKE '%' || char(11) || '%' OR kind LIKE '%' || char(12) || '%' "
-        "OR kind LIKE '%' || char(160) || '%'"
+        "SELECT id, kind FROM memory_items WHERE kind GLOB '*[^a-z0-9_ -]*' "
+        "OR length(kind) NOT BETWEEN 1 AND 32 OR kind != TRIM(kind) OR kind LIKE '%  %'"
     ).fetchall()
+    # approval is bound to the kind (INV-01): `Feedback` was no rule, `feedback` is
+    unapprove = ", trusted_at = NULL, trusted_by = NULL" if "trusted_at" in live_cols else ""
     for r in odd:
-        # the same normalisation writes get (case, trim, whitespace collapse);
-        # a value that still fails validation is left for the owner to fix
-        norm = _re.sub(r"\s+", " ", str(r["kind"]).strip().lower())
+        norm = _repaired_kind(r["kind"])
         if norm != r["kind"]:
-            conn.execute("UPDATE memory_items SET kind = ? WHERE id = ?", (norm, r["id"]))
-    # 0.11: visibility is validated on write; a pre-0.11 row with an off-enum
-    # value ("team", "../x") could no longer be updated at all. Repair to the
-    # safe default — private — once, on open.
+            conn.execute(f"UPDATE memory_items SET kind = ?{unapprove} WHERE id = ? AND kind = ?",
+                         (norm, r["id"], r["kind"]))
+    # visibility: an off-enum value ("team", "../x") is private
     bad = conn.execute(
         "SELECT id FROM memory_items WHERE LOWER(TRIM(visibility)) "
         "NOT IN ('public', 'shared', 'private') "
@@ -307,17 +363,28 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "WHERE LOWER(TRIM(visibility)) NOT IN ('public','shared','private') "
             "OR visibility != LOWER(TRIM(visibility))"
         )
-    # v10, same self-healing reason: a DB whose version says 10 but whose ALTER
-    # never landed would otherwise fail every read with "no such column: origin".
+    # strength and TTL out of range
+    if conn.execute("SELECT 1 FROM memory_items WHERE strength NOT BETWEEN 0 AND ? "
+                    "OR typeof(ttl_days) NOT IN ('integer', 'null') "
+                    "OR ttl_days NOT BETWEEN 1 AND 3650 LIMIT 1",
+                    (STRENGTH_CAP,)).fetchone() is not None:
+        conn.execute("UPDATE memory_items SET strength = MIN(MAX(strength, 0), ?) "
+                     "WHERE strength NOT BETWEEN 0 AND ?", (STRENGTH_CAP, STRENGTH_CAP))
+        conn.execute("UPDATE memory_items SET ttl_days = CASE WHEN CAST(ttl_days AS INTEGER) < 1 "
+                     "THEN NULL ELSE MIN(CAST(ttl_days AS INTEGER), 3650) END "
+                     "WHERE typeof(ttl_days) NOT IN ('integer', 'null') "
+                     "OR ttl_days NOT BETWEEN 1 AND 3650")
+    # "" (0.11.3 `write --project ""`) is the NULL a write now stores: a dump carries only null
+    for name in ("project", "agent", "source_session"):
+        if conn.execute(f"SELECT 1 FROM memory_items WHERE {name} = '' LIMIT 1").fetchone():
+            conn.execute(f"UPDATE memory_items SET {name} = NULL WHERE {name} = ''")
     if not {"origin", "trusted_at", "trusted_by"} <= live_cols:
         _migrate_v10(conn)
-    # after v10: the backfill reads origin and trusted_at, and repairs a database
-    # whose column landed without them
-    _migrate_owner_seal(conn)
+    _migrate_owner_seal(conn)     # after v10: its backfill reads origin and trusted_at
 
-    if _current_schema_version(conn) >= CURRENT_SCHEMA_VERSION:
-        return
 
+def _migrate_versioned(conn: sqlite3.Connection) -> None:
+    """The version-gated steps; the caller holds the write lock."""
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
     if "body_path" not in cols:
         _add_column(conn, "body_path TEXT")
@@ -325,82 +392,68 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _add_column(conn, "stemmed TEXT NOT NULL DEFAULT ''")
 
     history_cols = {row["name"] for row in conn.execute("PRAGMA table_info(memory_history)")}
-    history_needs_chain = "self_hash" not in history_cols
-    if history_needs_chain:
-        conn.execute("ALTER TABLE memory_history ADD COLUMN prev_hash TEXT")
-        conn.execute("ALTER TABLE memory_history ADD COLUMN self_hash TEXT")
+    if "prev_hash" not in history_cols:
+        _add_column(conn, "prev_hash TEXT", table="memory_history")
+    if "self_hash" not in history_cols:
+        # The column and the chain land together, so only a database that never
+        # had the column is signed: one with its hashes cleared is a tamper.
+        _add_column(conn, "self_hash TEXT", table="memory_history")
+        _backfill_history_chain(conn)
 
-    existing_tables = {row[0] for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
-    )}
-    if "mem_fts_stem" not in existing_tables:
-        conn.executescript("""
-            CREATE VIRTUAL TABLE mem_fts_stem USING fts5(
+    # The index and its triggers are built whole or rebuilt, statement by
+    # statement (executescript() commits first): a table without its triggers
+    # is an index no write maintains.
+    build = {"mem_fts_stem", "mem_stem_ai", "mem_stem_ad", "mem_stem_au"} - {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    if build:
+        for name in ("mem_stem_ai", "mem_stem_ad", "mem_stem_au"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts_stem USING fts5(
                 stemmed,
                 content='memory_items', content_rowid='id',
                 tokenize='unicode61 remove_diacritics 2'
-            );
-
-            CREATE TRIGGER mem_stem_ai AFTER INSERT ON memory_items BEGIN
-                INSERT INTO mem_fts_stem(rowid, stemmed) VALUES (new.id, new.stemmed);
-            END;
-            CREATE TRIGGER mem_stem_ad AFTER DELETE ON memory_items BEGIN
-                INSERT INTO mem_fts_stem(mem_fts_stem, rowid, stemmed)
-                VALUES('delete', old.id, old.stemmed);
-            END;
-            CREATE TRIGGER mem_stem_au AFTER UPDATE ON memory_items BEGIN
-                INSERT INTO mem_fts_stem(mem_fts_stem, rowid, stemmed)
-                VALUES('delete', old.id, old.stemmed);
-                INSERT INTO mem_fts_stem(rowid, stemmed) VALUES (new.id, new.stemmed);
-            END;
-        """)
+            )""")
 
     rows = conn.execute(
-        "SELECT id, title, body FROM memory_items WHERE stemmed IS NULL OR stemmed = ''"
+        "SELECT * FROM memory_items WHERE stemmed IS NULL OR stemmed = ''"
     ).fetchall()
     if rows:
         log.info("backfilling Snowball stems for %d rows", len(rows))
         for r in rows:
-            stemmed = _stem_text(f"{r['title']}\n{r['body']}")
-            conn.execute(
-                "UPDATE memory_items SET stemmed = ? WHERE id = ?",
-                (stemmed, r["id"]),
-            )
+            conn.execute("UPDATE memory_items SET stemmed = ? WHERE id = ?",
+                         (_row_stems(r), r["id"]))
 
-    if history_needs_chain:
-        _backfill_history_chain(conn)
+    if build:
+        conn.execute("INSERT INTO mem_fts_stem(mem_fts_stem) VALUES('rebuild')")
+        conn.execute("""
+            CREATE TRIGGER mem_stem_ai AFTER INSERT ON memory_items BEGIN
+                INSERT INTO mem_fts_stem(rowid, stemmed) VALUES (new.id, new.stemmed);
+            END""")
+        conn.execute("""
+            CREATE TRIGGER mem_stem_ad AFTER DELETE ON memory_items BEGIN
+                INSERT INTO mem_fts_stem(mem_fts_stem, rowid, stemmed)
+                VALUES('delete', old.id, old.stemmed);
+            END""")
+        conn.execute("""
+            CREATE TRIGGER mem_stem_au AFTER UPDATE ON memory_items BEGIN
+                INSERT INTO mem_fts_stem(mem_fts_stem, rowid, stemmed)
+                VALUES('delete', old.id, old.stemmed);
+                INSERT INTO mem_fts_stem(rowid, stemmed) VALUES (new.id, new.stemmed);
+            END""")
 
-    # --- v5: skill learning columns ---
+    # v5: skill learning columns
     if "access_count" not in cols:
         _add_column(conn, "access_count INTEGER NOT NULL DEFAULT 0")
     if "last_accessed_at" not in cols:
         _add_column(conn, "last_accessed_at INTEGER")
 
-    # --- v6: semantic embedding column ---
-    # Column is added empty; backfill is a separate, optional, network-bound
-    # step (`skillmem reindex-embeddings`) so the migration never blocks on a
-    # model download. Recall falls back to BM25 for rows without an embedding.
-    if "embedding" not in cols:
-        _add_column(conn, "embedding BLOB")
+    # v8: drop the legacy porter FTS index, superseded by mem_fts_stem
+    for ddl in ("DROP TRIGGER IF EXISTS memory_items_ai", "DROP TRIGGER IF EXISTS memory_items_ad",
+                "DROP TRIGGER IF EXISTS memory_items_au", "DROP TABLE IF EXISTS mem_fts"):
+        conn.execute(ddl)
 
-    # --- v8: drop the legacy porter FTS index ---
-    # mem_fts was superseded by mem_fts_stem (Snowball) and had no readers
-    # left, yet its three triggers doubled the FTS work on every write.
-    conn.executescript(
-        """
-        DROP TRIGGER IF EXISTS memory_items_ai;
-        DROP TRIGGER IF EXISTS memory_items_ad;
-        DROP TRIGGER IF EXISTS memory_items_au;
-        DROP TABLE IF EXISTS mem_fts;
-        """
-    )
-
-    # --- v9: evidence-weighted reinforcement ---
-    # `pinned` exempts a rule from decay and archiving: a rule that matters
-    # precisely because it is rarely needed ("deploy only through the gate")
-    # must not fade at the same rate as a note nobody reads. The two counters
-    # keep confirmations and failures apart from raw retrieval count, so a
-    # skill's strength can be traced back to what actually confirmed it.
+    # v9: pinning and evidence counters
     if "pinned" not in cols:
         _add_column(conn, "pinned INTEGER NOT NULL DEFAULT 0")
     if "confirmed_count" not in cols:
@@ -408,31 +461,37 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "failure_count" not in cols:
         _add_column(conn, "failure_count INTEGER NOT NULL DEFAULT 0")
 
-    # --- v10: provenance, and trust as an explicit act ---
-    # The loop this closes: an external text (a README, a web page) reaches a
-    # transcript, a model distils it into a note, and the note comes back as a
-    # rule in the next session. Origin records where text came from; trust is
-    # only ever granted by the owner, because an agent can be talked into
-    # storing a rule by the very document it was reading.
-    if not {"origin", "trusted_at", "trusted_by"} <= cols:
-        _migrate_v10(conn)
-
-    # --- v11: the lexical index has to be rebuilt, but NOT here ---
-    # It used to drop tokens shorter than three characters, so `db`, `py`, `js`,
-    # `ci` were missing from every row and a query like "db.py" could not match
-    # however well the query itself was tokenised. The column is derived, so the
-    # fix only reaches stored memories by rebuilding it — and on a real database
-    # (8917 rows) that takes about a minute, while init_schema runs inside every
-    # hook under a 10s timeout. So the migration only leaves a flag: the nightly
-    # decay job picks it up, or `skillmem reindex-lexical` does it now.
+    # v11: two-character tokens joined the lexical index. Rebuilding it takes
+    # about a minute on a large database, too long for a hook's open, so only a
+    # non-empty database is flagged: the nightly decay job or
+    # `skillmem reindex-lexical` rebuilds it.
     if _current_schema_version(conn) < 11 and conn.execute(
             "SELECT EXISTS(SELECT 1 FROM memory_items)").fetchone()[0]:
-        # Only an existing database has a stale index to rebuild; a fresh one is
-        # already correct, and flagging it would send the nightly job on a
-        # pointless pass and make `doctor` look alarming on a clean install.
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES "
             "('lexical_reindex_pending', '1')")
+
+    # v12: each body where a write puts it (_body_in_file). Before, a file was
+    # kept on the same text and a document from before body files was inline,
+    # so get().body was not what the record's own dump restored (INV-06). A
+    # repair: the text, its hash and updated_at stay (INV-03).
+    if _current_schema_version(conn) < 12:
+        for r in conn.execute("SELECT id, slug, kind, title, body, body_path, content_hash "
+                              "FROM memory_items").fetchall():
+            text = (verified_body_file(r["title"], r["body_path"], r["content_hash"])
+                    if r["body_path"] else r["body"])
+            if text is None or _body_in_file(r["kind"], text) == bool(r["body_path"]):
+                continue    # an unverified file is not the text, and stays
+            path = None
+            if not r["body_path"]:
+                try:
+                    _stage_body_file(conn, r["slug"], text, r["content_hash"])
+                except OSError:
+                    continue    # an open never fails over a placement
+                path = _body_filename(r["slug"], ns=_db_namespace(conn),
+                                      content_hash=r["content_hash"])
+            conn.execute("UPDATE memory_items SET body = ?, body_path = ? WHERE id = ?",
+                         (_make_excerpt(text) if path else text, path, r["id"]))
 
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
@@ -440,8 +499,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
     )
 
 
-# Origin of existing rows, in priority order — the first match wins, so a skill
-# carrying the imported tag is imported, not agent.
 def lexical_reindex_pending(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT value FROM meta WHERE key = 'lexical_reindex_pending'").fetchone()
@@ -452,32 +509,26 @@ def restem_all(conn: sqlite3.Connection) -> int:
     """Rebuild the lexical index and clear the pending flag. Minutes, not seconds,
     on a large database — call it from a scheduled job or by hand, never from a
     hook."""
-    n = _restem_all(conn)
+    n = 0
+    with tx(conn):     # read under the lock: an edit committed before it is indexed
+        for r in conn.execute("SELECT * FROM memory_items").fetchall():
+            conn.execute("UPDATE memory_items SET stemmed = ? WHERE id = ?",
+                         (_row_stems(r), r["id"]))
+            n += 1
+    log.info("re-stemmed %d rows for v11", n)
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES "
                  "('lexical_reindex_pending', '0')")
     return n
 
 
-def _restem_all(conn: sqlite3.Connection) -> int:
-    """Rebuild the stemmed column for every row. No model, no network, one pass."""
-    rows = conn.execute(
-        "SELECT * FROM memory_items"
-    ).fetchall()
-    n = 0
-    with tx(conn):
-        for r in rows:
-            # the DB body is only an excerpt for externalized documents; index
-            # the whole text or the tail stops matching after every reindex
-            body = load_body(MemoryItem.from_row(r)) if r["body_path"] else r["body"]
-            stemmed = _stem_text(
-                f"{r['title']}\n{body}\n"
-                + " ".join(_parse_json_list(r["tags"]) + _parse_json_list(r["topics"]))
-            )
-            conn.execute("UPDATE memory_items SET stemmed = ? WHERE id = ?",
-                         (stemmed, r["id"]))
-            n += 1
-    log.info("re-stemmed %d rows for v11", n)
-    return n
+def _row_stems(r: sqlite3.Row) -> str:
+    """A stored row's lexical index text: what upsert writes for it — title,
+    whole body, tags and topics. The v5 backfill stemmed title and excerpt only."""
+    # the DB body is only an excerpt for externalized documents; index
+    # the whole text or the tail stops matching after every reindex
+    body = load_body(MemoryItem.from_row(r)) if r["body_path"] else r["body"]
+    return _stem_text(f"{r['title']}\n{body}\n"
+                      + " ".join(_parse_json_list(r["tags"]) + _parse_json_list(r["topics"])))
 
 
 _ORIGIN_BACKFILL = (
@@ -497,124 +548,87 @@ _V10_COLUMNS = (
 def _backup_before_v10(conn: sqlite3.Connection) -> None:
     """A copy of the database before its first structural change of this release.
 
-    Cheap insurance the changelog promises: SQLite's own backup API, so a WAL in
-    flight cannot produce a torn copy. A failure here must not block the upgrade —
-    the migration itself is additive.
+    SQLite's backup API, so a WAL in flight cannot produce a torn copy; a failure
+    never blocks the (additive) upgrade. Named for the database and the second
+    (INV-12), written beside its name and renamed into place (INV-16). Called
+    under the migration's write lock, after the check that the database is
+    unmigrated (INV-05), and so copied through a second connection: the backup
+    API waits forever on a source its own connection holds that lock on.
     """
+    tmp = None
     try:
         path = conn.execute("PRAGMA database_list").fetchone()[2]
         if not path:
             return  # :memory:
-        dest = Path(path).parent / "backups" / f"pre-v10-{int(time.time())}.db"
+        dest = Path(path).parent / "backups" / f"pre-v10-{Path(path).name}-{int(time.time())}.db"
         if dest.exists():
             return
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(str(dest)) as out:
-            conn.backup(out)
+        tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+        source, out = sqlite3.connect(f"{Path(path).as_uri()}?mode=ro", uri=True), sqlite3.connect(str(tmp))
+        try:
+            source.backup(out)
+        finally:
+            source.close()
+            out.close()
+        os.replace(tmp, dest)
         log.info("pre-v10 backup written to %s", dest)
     except Exception as exc:  # noqa: BLE001 - never block the upgrade
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
         log.warning("could not write the pre-v10 backup: %s", exc)
 
 
 def _migrate_owner_seal(conn: sqlite3.Connection) -> None:
     """Add owner_seal and seal what the owner already wrote or approved.
 
-    Set once, never cleared: this record was the owner's, whatever happens to it
-    later. `origin` and `trusted_at` both move under an agent's own writes
-    (mem_update relabels origin to 'agent' and drops the approval, by design), so
-    neither can carry a rule the same agent must not be able to lift. Checked on
-    every open, like v10's columns: a database carrying v10 already never runs
-    that migration again, and this column has to reach those databases too.
-
-    The backfill is one-shot, recorded in `meta`. Row-level presence used to be
-    the proof, so a row an agent legitimately wrote with origin='owner' and
-    owner_seal=0 (no terminal, so upsert did not mint) was retroactively sealed
-    on the next open — which made the migration itself a way to reach the seal
-    without a terminal. Once the backfill has run, later opens leave every
-    unsealed row alone; upsert is the only place that mints the seal now.
+    Set once, never cleared (INV-02): `origin` and `trusted_at` both move under an
+    agent's own writes, so neither can carry a rule the agent must not lift.
+    Checked on every open, like v10's columns. The backfill is one-shot, recorded
+    in `meta`: once it has run, upsert is the only place that mints the seal, and
+    a later open never seals a row an agent wrote with origin='owner'.
     """
-    # Read first, and take no write lock when there is nothing to do: this runs
-    # on EVERY open, and a BEGIN IMMEDIATE here made `inject`, `recall` and
-    # mem_search fail with "database is locked" behind any writer — init_schema
-    # dropped its own write-on-open for exactly that reason.
+    # read first: no write lock on an open with nothing to do
     have = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
-    done = None
-    if "owner_seal" in have:
-        done = conn.execute(
-            "SELECT value FROM meta WHERE key = 'owner_seal_backfill_done'"
-        ).fetchone()
-        if done is not None:
-            return
-    try:
-        with tx(conn):   # BEGIN IMMEDIATE: two processes may open the same file
-            have = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
-            if "owner_seal" not in have:
-                conn.execute(
-                    "ALTER TABLE memory_items ADD COLUMN owner_seal "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-                # An interrupted migration or a rolled-back backup can leave
-                # the marker set but the column absent. The column just came
-                # back empty, so the backfill has to run again — drop the
-                # stale marker rather than trust it.
-                conn.execute(
-                    "DELETE FROM meta WHERE key = 'owner_seal_backfill_done'"
-                )
-            done = conn.execute(
-                "SELECT value FROM meta WHERE key = 'owner_seal_backfill_done'"
-            ).fetchone()
-            if done is None:
-                conn.execute(
-                    "UPDATE memory_items SET owner_seal = 1 "
-                    "WHERE owner_seal = 0 AND (origin = 'owner' OR trusted_at IS NOT NULL)"
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES "
-                    "('owner_seal_backfill_done', '1')"
-                )
-    except sqlite3.OperationalError as exc:
-        if "duplicate column" not in str(exc).lower():
-            raise
+    if "owner_seal" in have and conn.execute(
+            "SELECT 1 FROM meta WHERE key = 'owner_seal_backfill_done'").fetchone():
+        return
+    with tx(conn):
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
+        if "owner_seal" not in have:
+            _add_column(conn, "owner_seal INTEGER NOT NULL DEFAULT 0")
+            # a marker without its column (an interrupted migration): the
+            # column came back empty, so the backfill runs again
+            conn.execute("DELETE FROM meta WHERE key = 'owner_seal_backfill_done'")
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'owner_seal_backfill_done'"
+                        ).fetchone() is None:
+            conn.execute(
+                "UPDATE memory_items SET owner_seal = 1 "
+                "WHERE owner_seal = 0 AND (origin = 'owner' OR trusted_at IS NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES "
+                "('owner_seal_backfill_done', '1')"
+            )
 
 
 def _migrate_v10(conn: sqlite3.Connection) -> None:
-    """Add provenance + approval, atomically, once.
-
-    Two processes can open the same database at the same moment (a recall hook
-    and the CLI), so the columns are re-checked after the write lock is held:
-    without that the loser of the race dies on a duplicate column, and a partial
-    set of columns would then fail every read.
-    """
-    _backup_before_v10(conn)
-    try:
-        with tx(conn):  # BEGIN IMMEDIATE — the lock is held for the whole change
-            have = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
-            added = False
-            for name, decl in _V10_COLUMNS:
-                if name not in have:
-                    conn.execute(f"ALTER TABLE memory_items ADD COLUMN {name} {decl}")
-                    added = True
-            if added:
-                _backfill_origin(conn)
-    except sqlite3.OperationalError as exc:
-        # Another process finished the same migration between our check and the
-        # lock; anything else is a real problem worth surfacing.
-        if "duplicate column" not in str(exc).lower():
-            raise
+    """Add provenance + approval, atomically, once: the columns are checked
+    again under the write lock another opener may hold."""
+    with tx(conn):
+        have = {row["name"] for row in conn.execute("PRAGMA table_info(memory_items)")}
+        missing = [(name, decl) for name, decl in _V10_COLUMNS if name not in have]
+        for name, decl in missing:
+            _add_column(conn, f"{name} {decl}")
+        if missing:
+            _backfill_origin(conn)
 
 
 def _classify_tags(conn: sqlite3.Connection) -> tuple[list[int], list[int]]:
-    """Split rows into (imported, unreadable) by their tag list.
-
-    Deliberately not json_each: a missing JSON1 extension or one malformed list
-    used to fail the whole rule, and those rows then fell through to the
-    kind-based rules — which turned someone else's pack into a trusted rule.
-
-    A row whose tags will not parse is not guessed at either way: truncated JSON
-    can hide the marker entirely (`'["imported",'`), so it is labelled `unknown`,
-    which is never grandfathered. An upgrade that leaves a handful of rows
-    needing `skillmem trust` is a cost; approving a pack silently is not.
-    """
+    """Split rows into (imported, unreadable) by their tag list, in Python:
+    one malformed list must not fail the rule and let a pack fall through to the
+    kind rules. A row whose tags will not parse stays `unknown`, never
+    grandfathered: truncated JSON can hide the marker (`'["imported",'`)."""
     imported: list[int] = []
     unreadable: list[int] = []
     for row in conn.execute("SELECT id, tags FROM memory_items"):
@@ -634,12 +648,10 @@ def _classify_tags(conn: sqlite3.Connection) -> tuple[list[int], list[int]]:
 
 
 def _backfill_origin(conn: sqlite3.Connection) -> None:
-    """Label existing rows, then grandfather only what the owner accumulated.
-
-    Grandfathering is a deliberate, stated compromise: the alternative is that
-    every rule the owner has relied on for months arrives unapproved on the
-    morning after an upgrade. Imported packs and transcript summaries never get it.
-    """
+    """Label existing rows, then grandfather only what the owner accumulated:
+    their own notes and rules, and the skills their sessions learned (INV-02's
+    stated exception). Never an imported pack, a transcript summary (`derived`)
+    or a row whose tags cannot be read."""
     now = int(time.time())
     imported, unreadable = _classify_tags(conn)
     if imported:
@@ -647,24 +659,15 @@ def _backfill_origin(conn: sqlite3.Connection) -> None:
         conn.execute(
             f"UPDATE memory_items SET origin = 'imported' WHERE id IN ({marks})",
             imported)
-    # Rows whose tags we could not read keep origin='unknown' and are held back
-    # from the kind rules below: we cannot see their provenance, so we neither
-    # invent one nor approve them.
     skip = "" if not unreadable else (
         f" AND id NOT IN ({','.join('?' * len(unreadable))})")
     for origin, clause in _ORIGIN_BACKFILL:
         conn.execute(
             f"UPDATE memory_items SET origin = ? WHERE origin = 'unknown' "
             f"AND ({clause}){skip}", (origin, *unreadable))
-    # Grandfather only what the owner accumulated themselves: their own notes and
-    # rules, and the skills their own sessions learned. Never an imported pack,
-    # and never a transcript summary — `derived` is precisely the class this
-    # release exists to distrust, and approving 7809 of them at once would empty
-    # the marker of meaning on day one.
     conn.execute(
-        # owner_seal is NOT set here: this runs inside the v10 migration, before
-        # that column exists, and SQLite resolves names at prepare time.
-        # _migrate_owner_seal seals these same rows right afterwards.
+        # no owner_seal here: the column may not exist yet; _migrate_owner_seal
+        # seals these same rows right afterwards
         "UPDATE memory_items SET trusted_at = ?, trusted_by = 'migration-v10' "
         "WHERE trusted_at IS NULL AND origin IN ('owner', 'agent')", (now,))
 
@@ -699,17 +702,18 @@ def _backfill_history_chain(conn: sqlite3.Connection) -> None:
     log.info("backfilling memory_history hash-chain for %d rows", len(rows))
     prev = None
     for r in rows:
-        payload = {
-            "slug": r["slug"], "old_title": r["old_title"], "old_body": r["old_body"],
-            "changed_at": r["changed_at"], "changed_by": r["changed_by"],
-            "reason": r["reason"],
-        }
-        h = _chain_hash(prev, payload)
+        h = _chain_hash(prev, _chain_payload(r))
         conn.execute(
             "UPDATE memory_history SET prev_hash = ?, self_hash = ? WHERE id = ?",
             (prev, h, r["id"]),
         )
         prev = h
+
+
+def _chain_payload(r: Any) -> dict[str, Any]:
+    """The fields of a history row its hash is taken over."""
+    return {k: r[k] for k in ("slug", "old_title", "old_body", "changed_at",
+                              "changed_by", "reason")}
 
 
 def _last_chain_hash(conn: sqlite3.Connection) -> str | None:
@@ -729,10 +733,7 @@ def _chain_clock(conn: sqlite3.Connection, now: int) -> int:
     the timestamp to the tip instead of reordering existing chains."""
     row = conn.execute("SELECT MAX(changed_at) AS t FROM memory_history").fetchone()
     tip = int(row["t"]) if row and row["t"] is not None else 0
-    if tip - now > 86400 and not _CLOCK_WARNED:
-        # a row stamped far in the future (clock was wrong) pins every later
-        # stamp to it until real time catches up — by design (the chain
-        # must stay ordered). One line per process, not per write.
+    if tip - now > 86400 and not _CLOCK_WARNED:   # once per process
         _CLOCK_WARNED.append(True)
         log.warning("history clock: tip is %d s ahead of now; clamping", tip - now)
     return max(now, tip)
@@ -764,13 +765,9 @@ def _stem_word(word: str) -> str:
 def _stem_text(text: str) -> str:
     """Return text where every token is replaced by its Snowball stem.
 
-    Single characters are dropped as BM25 noise; two-character tokens are kept
-    because in this domain they carry the meaning — `db`, `py`, `js`, `ci`, `ui`,
-    `go`. Dropping them made a query like "db.py" match nothing at all, however
-    well the query side was tokenised. Stems are joined by spaces; punctuation is
-    discarded — Snowball is what gives lexical recall here, FTS5 just BM25-ranks
-    the result, and a frequent short word is down-weighted by BM25 anyway.
-    """
+    Single characters are dropped as BM25 noise; two-character tokens carry the
+    meaning in this domain (`db`, `py`, `ci`) and are kept. Punctuation is
+    discarded."""
     if not text:
         return ""
     out: list[str] = []
@@ -792,11 +789,15 @@ def _now() -> int:
 
 
 def _hash(title: str, body: str) -> str:
-    h = hashlib.sha256()
-    h.update(title.encode("utf-8"))
-    h.update(b"\n\x00\n")
-    h.update(body.encode("utf-8"))
-    return h.hexdigest()
+    # JSON frames both strings unambiguously, and contains no literal NUL:
+    # its input cannot alias the legacy title + NUL delimiter + body format.
+    return hashlib.sha256(json.dumps([title, body], ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _matches_hash(title: str, body: str, content_hash: str) -> bool:
+    """Verify old records too, with the title fixed by the stored row."""
+    return (content_hash == _hash(title, body) or content_hash == hashlib.sha256(
+        (title + "\n\0\n" + body).encode("utf-8")).hexdigest())
 
 
 def _wordcount(body: str) -> int:
@@ -840,7 +841,6 @@ class MemoryItem:
     attachments: list[str] = field(default_factory=list)
     ttl_days: int | None = None
     freshness_until: int | None = None
-    confidence: float = 1.0
     strength: float = 1.0
     pinned: bool = False
     lifecycle: str = "active"
@@ -849,17 +849,14 @@ class MemoryItem:
     failure_count: int = 0
     access_count: int = 0
     last_accessed_at: int | None = None
-    # Where the text came from — never a judgement, just a fact:
-    # owner (a human typed it) / agent (an agent stored it mid-session) /
-    # imported (someone else's pack) / derived (a model's summary of a
-    # transcript) / unknown.
+    last_decayed_at: int | None = None
+    # Where the text came from (ORIGINS): owner / agent / imported (a pack) /
+    # derived (a model's summary of a transcript) / unknown.
     origin: str = "unknown"
-    # Trust is an explicit act by the owner, not a guess from origin: an agent
-    # can be talked into storing a rule by a README it was reading.
+    # set only by the owner's explicit approval, never inferred from origin
     trusted_at: int | None = None
     trusted_by: str | None = None
     id: int | None = None
-    supersedes_id: int | None = None
     content_hash: str = ""
     wordcount: int = 0
     created_at: int = 0
@@ -868,43 +865,14 @@ class MemoryItem:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "MemoryItem":
-        return cls(
-            id=row["id"],
-            slug=row["slug"],
-            kind=row["kind"],
-            title=row["title"],
-            body=row["body"],
-            body_path=row["body_path"] if "body_path" in row.keys() else None,
-            project=row["project"],
-            tags=_parse_json_list(row["tags"]),
-            topics=_parse_json_list(row["topics"]),
-            visibility=row["visibility"],
-            agent=row["agent"],
-            source_session=row["source_session"],
-            attachments=_parse_json_list(row["attachments"]),
-            ttl_days=row["ttl_days"],
-            freshness_until=row["freshness_until"],
-            wordcount=row["wordcount"],
-            content_hash=row["content_hash"],
-            supersedes_id=row["supersedes_id"],
-            confidence=row["confidence"],
-            strength=row["strength"],
-            pinned=bool(row["pinned"]) if "pinned" in row.keys() else False,
-            lifecycle=(row["lifecycle"] if "lifecycle" in row.keys() else "active"),
-            owner_seal=(row["owner_seal"] if "owner_seal" in row.keys() else 0),
-            confirmed_count=(row["confirmed_count"]
-                             if "confirmed_count" in row.keys() else 0),
-            failure_count=row["failure_count"] if "failure_count" in row.keys() else 0,
-            access_count=row["access_count"] if "access_count" in row.keys() else 0,
-            last_accessed_at=row["last_accessed_at"] if "last_accessed_at" in row.keys() else None,
-            origin=(row["origin"] if "origin" in row.keys() and row["origin"]
-                    else "unknown"),
-            trusted_at=row["trusted_at"] if "trusted_at" in row.keys() else None,
-            trusted_by=row["trusted_by"] if "trusted_by" in row.keys() else None,
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            deleted_at=row["deleted_at"],
-        )
+        """The item a memory_items row holds; a column an older schema lacks
+        keeps its default."""
+        have = row.keys()
+        kw = {f.name: row[f.name] for f in fields(cls) if f.name in have}
+        kw.update({k: _parse_json_list(row[k]) for k in _LIST_COLUMNS})
+        kw["pinned"] = bool(kw.get("pinned", False))
+        kw["origin"] = kw.get("origin") or "unknown"
+        return cls(**kw)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -932,28 +900,10 @@ def scrub(text: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _kind_is_a_change(item: "MemoryItem", row: Any, explicit: set[str] | None) -> bool:
-    """Is this write asking to change the record's kind?
-
-    `explicit=None` means "apply every field the caller set", so the kind counts
-    there too — conditioning the guard on the caller having named `kind` made it
-    opt-in on the caller's honesty, and migrate, packs and the importer all pass
-    None. When an explicit set is given, only a named kind counts: every MCP tool
-    fills in a default kind the caller never asked for.
-    """
-    if item.kind == row["kind"]:
-        return False
-    return explicit is None or "kind" in explicit
-
-
 def owner_present() -> bool:
-    """True when a person is at a terminal. The only honest owner signal.
-
-    An agent runs the CLI through Bash as easily as a human types it, so the
-    module a call comes from says nothing: `skillmem write` and `skillmem migrate`
-    are as reachable by an agent as any MCP tool. The TTY is the difference, and
-    it is checked here so that every surface asks the same question.
-    """
+    """True when a person is at a terminal: the one owner signal every
+    surface asks. The module a call comes from says nothing, since an agent
+    runs the CLI through Bash as easily as a person types it."""
     try:
         if not (sys.stdin.isatty() or sys.stdout.isatty()):
             return False
@@ -961,10 +911,8 @@ def owner_present() -> bool:
         return False
     if sys.platform != "win32":
         return True
-    # Windows: isatty() is true for any character device, and that includes NUL.
-    # `stdin=DEVNULL` from an agent's subprocess therefore looked like a person
-    # at a keyboard. Ask the console itself instead: GetConsoleMode succeeds on a
-    # real console handle and fails on NUL, a pipe or a file.
+    # Windows: isatty() is true for NUL too (`stdin=DEVNULL`); GetConsoleMode
+    # succeeds on a real console only.
     try:
         import ctypes
         from ctypes import wintypes
@@ -1002,8 +950,12 @@ def docs_dir() -> Path:
     return path
 
 
-def _should_externalize(item: "MemoryItem") -> bool:
-    return item.kind == "document" or len(item.body) > DOC_BODY_THRESHOLD
+def _body_in_file(kind: str, body: str) -> bool:
+    """Whether a body is kept in a file: the kind and length decide, never the
+    row's past. A file kept on the same text left a note once a document an
+    excerpt, which its own dump restored whole (INV-06); a missing file is
+    repaired either way."""
+    return kind == "document" or len(body) > DOC_BODY_THRESHOLD
 
 
 def _make_excerpt(body: str, limit: int = DOC_EXCERPT_CHARS) -> str:
@@ -1018,53 +970,120 @@ def _make_excerpt(body: str, limit: int = DOC_EXCERPT_CHARS) -> str:
     return head + "…"
 
 
-def _db_identity(conn: sqlite3.Connection) -> str:
-    """8 hex chars of the resolved database path — no default special case."""
+def file_path(path: str | os.PathLike) -> Path:
+    """``path`` resolved, and spelled as the file system stores it as far as
+    it exists: one spelling per file. resolve() keeps the caller's case on
+    APFS (and on Linux, where file systems that ignore case are rare), so
+    `M.db` and `m.db` were two databases in one file (INV-12). Windows'
+    resolve() already spells the stored name."""
+    resolved = Path(path).resolve()
+    if sys.platform != "darwin":
+        return resolved
+    import fcntl
+    tail: list[str] = []
+    here = resolved
+    while True:
+        try:
+            fd = os.open(here, os.O_RDONLY | os.O_NONBLOCK)    # a FIFO does not block
+        except OSError:
+            if here.parent == here:
+                return resolved
+            tail.insert(0, here.name)
+            here = here.parent
+            continue
+        try:
+            stored = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\0")
+        except OSError:
+            return resolved
+        finally:
+            os.close(fd)
+        return Path(os.fsdecode(stored), *tail)
+
+
+def _db_path(conn: sqlite3.Connection) -> str:
+    """The database file's path (``file_path``), or ":memory:"."""
     try:
         row = conn.execute("PRAGMA database_list").fetchone()
-        path = str(Path(row[2]).resolve()) if row and row[2] else ":memory:"
+        return str(file_path(row[2])) if row and row[2] else ":memory:"
     except (sqlite3.Error, OSError, TypeError):
-        path = ":memory:"
-    return hashlib.sha256(path.encode("utf-8")).hexdigest()[:8]
+        return ":memory:"
+
+
+def _db_inode(conn: sqlite3.Connection) -> str:
+    """The database file's inode number, or "" where there is none."""
+    try:
+        return str(os.stat(_db_path(conn)).st_ino or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _db_id(conn: sqlite3.Connection) -> str:
+    """The random id init_schema gave this database when it was created,
+    or "" for one that already held records when 0.12.0 first opened it.
+
+    The id is stored in the file, so `cp` copies it: a file whose inode is
+    not the one init_schema recorded with it is a copy (or was moved across
+    file systems), another database, and gets an id derived from both."""
+    try:
+        meta = dict(conn.execute(
+            "SELECT key, value FROM meta WHERE key IN ('db_id', 'db_file')").fetchall())
+    except sqlite3.Error:
+        return ""
+    db_id, ino = str(meta.get("db_id") or ""), _db_inode(conn)
+    if meta.get("db_file") in (None, ino) or not ino:
+        return db_id
+    return hashlib.sha256(f"{db_id}\0{ino}".encode("utf-8")).hexdigest()[:32]
+
+
+def _db_identity(conn: sqlite3.Connection, db_id: str | None = None) -> str:
+    """8 hex chars naming this database: its resolved path and its id. The
+    path alone names a place, and a newcomer there took over a moved
+    database's files; the id travels with the file (INV-12)."""
+    key = _db_path(conn)
+    if key == ":memory:":
+        key += str(id(conn))
+    return _identity(key, _db_id(conn) if db_id is None else db_id)
+
+
+def _identity(path: str, db_id: str) -> str:
+    """The name `_db_identity` gives the database with ``db_id`` at ``path``."""
+    key = path + ("\0" + db_id if db_id else "")
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
 
 
 def _db_namespace(conn: sqlite3.Connection) -> str:
-    """8 hex chars naming the database a body file belongs to.
-
-    docs/ is shared by every database under one SKILLMEM_HOME, and the file
-    name used to depend on the slug alone — so two databases with the same
-    slug read and overwrote one file. The default database keeps the empty
-    namespace so existing files stay valid; any other database gets its own.
-    """
-    try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        path = str(Path(row[2]).resolve()) if row and row[2] else f":memory:{id(conn)}"
-    except (sqlite3.Error, OSError, TypeError):
-        path = f":memory:{id(conn)}"
-    # Only the canonical file keeps the empty namespace — NOT whatever
-    # SKILLMEM_DB points at, or an override DB and memory.db would share it.
-    canonical = str((default_data_dir() / "memory.db").resolve())
-    if not path or path == canonical:
-        return ""
-    return hashlib.sha256(path.encode("utf-8")).hexdigest()[:8]
+    """8 hex chars naming the database a body file belongs to: docs/ is shared
+    by every database under one SKILLMEM_HOME. A database created before 0.12.0
+    keeps the namespace its existing files use: "" for the canonical memory.db,
+    its path's for any other. A file no skillmem initialised (purge's own
+    connect creates one) is neither and owns no files: at a moved legacy
+    database's path it took that one's (INV-12)."""
+    if not _db_id(conn):
+        try:
+            legacy = conn.execute("SELECT EXISTS (SELECT 1 FROM meta WHERE key = 'db_id') "
+                                  "OR EXISTS (SELECT 1 FROM memory_items)").fetchone()[0]
+        except sqlite3.Error:
+            legacy = False
+        if not legacy:
+            return _db_identity(conn, "\0")    # no id is "\0": no file carries it
+        if _db_path(conn) == str(file_path(default_data_dir() / "memory.db")):
+            return ""
+    return _db_identity(conn)
 
 
 def _body_filename(slug: str, *, ns: str = "", content_hash: str = "") -> str:
     """``<safe-slug>__<hash8>[-<ns8>][+<content32>].md``.
 
-    Content-addressed: a new body is a NEW file, never an overwrite of the one
-    a committed row points at. So publishing before COMMIT is safe — a rollback
-    leaves an orphan, which gc_body_files() collects, and never a row whose
-    file holds someone else's text.
+    Content-addressed (128 bits): a new body is a NEW file, never an overwrite
+    of the one a committed row points at, so a rollback leaves an orphan for
+    gc_body_files() and never a row whose file holds another text.
     """
     safe = _re.sub(r"[^\w.\-]+", "-", slug, flags=_re.UNICODE).strip("-") or "untitled"
+    safe = safe.encode("utf-8")[:100].decode("utf-8", "ignore")   # a 300-char slug: file name too long
     h = hashlib.sha256(slug.encode("utf-8")).hexdigest()[:8]
     if ns:
         h += f"-{ns}"
     if content_hash:
-        # 32 hex = 128 bits. Eight used to be enough to look unique and not
-        # be: two bodies sharing a prefix shared a file, and a rollback then
-        # left a row pointing at the other body's text.
         h += f"+{content_hash[:32]}"
     return f"{safe}__{h}.md"
 
@@ -1074,81 +1093,58 @@ _BODY_FILE_RE = _re.compile(
 )
 
 
-def _stage_body_file(conn: sqlite3.Connection, slug: str, body: str,
-                     content_hash: str) -> tuple[Path, Path]:
-    """Write the new body to a scratch file and publish it under its own name.
+def _file_namespace(name: str) -> str | None:
+    """The namespace suffix a body file name carries ("" or "-<ns8>"), or None
+    for a pre-0.11 name: it carries none and could be any database's."""
+    m = _BODY_FILE_RE.search(name)
+    return (m.group("ns") or "") if m and m.group("content") else None
 
-    The name carries the content hash, so this never touches the file a
-    committed row references; the row is switched to it by the transaction
-    that follows. If that transaction (or an outer one wrapping it) rolls
-    back, the row keeps pointing at the old file and this one is an orphan
-    for gc_body_files() — the two can no longer disagree.
-    """
+
+def _own_namespace(conn: sqlite3.Connection) -> str:
+    """The suffix ``_file_namespace`` finds in this database's body files."""
+    ns = _db_namespace(conn)
+    return f"-{ns}" if ns else ""
+
+
+def _stage_body_file(conn: sqlite3.Connection, slug: str, body: str,
+                     content_hash: str) -> None:
+    """Publish the body under its content-addressed name (see _body_filename).
+    Bytes, as its hash was taken over them. A failed transaction leaves the file
+    for gc_body_files(), never unlinks it: two writers of one text share it."""
     dest = docs_dir() / _body_filename(slug, ns=_db_namespace(conn),
                                        content_hash=content_hash)
     tmp = dest.with_suffix(dest.suffix + f".staged-{_uuid.uuid4().hex[:8]}")
-    tmp.write_text(body, encoding="utf-8")
+    tmp.write_bytes(body.encode("utf-8"))
     os.replace(tmp, dest)
-    return dest, dest
-
-
-def read_body_file(body_path: str) -> str | None:
-    """Public alias: callers that must distinguish the file's own bytes from the
-    excerpt load_body falls back to."""
-    return _read_body_file(body_path)
 
 
 def _read_body_file(body_path: str) -> str | None:
-    """Read an externalised body, or None if it is not there (a GC'd or moved
-    file must not take down the write that only wanted it for history)."""
+    """An externalised body's text, byte for byte (no newline translation),
+    or None when it is missing or not UTF-8: a damaged file never fails a write."""
     try:
-        return (docs_dir() / body_path).read_text(encoding="utf-8")
-    except OSError:
+        return (docs_dir() / body_path).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
-
-
-def _publish_body_file(staged: tuple[Path, Path]) -> str:
-    return staged[1].name
-
-
-def _discard_body_file(conn: sqlite3.Connection,
-                       staged: tuple[Path, Path] | None) -> None:
-    """A failed transaction leaves its (content-addressed) file for gc.
-
-    It must not unlink: with identical content two writers share one file,
-    and the one that lost on "database is locked" cannot see the winner's
-    uncommitted row — it would delete the file the winner is about to
-    reference. gc_body_files() removes true orphans after a grace period.
-    """
-    return None
 
 
 def gc_body_files(conn: sqlite3.Connection) -> int:
     """Delete body files this database no longer references. Returns count.
 
-    Only files in this database's namespace are candidates — another
-    database's files share the directory and are not ours to judge.
+    Only files in this database's namespace are candidates. Scanned and
+    unlinked under the write lock, so an open write transaction that has
+    published its files blocks this run; the 60 s grace covers staging before it.
     """
-    ns = _db_namespace(conn)
+    from .export import _filename_key
+
+    own = _own_namespace(conn)
     removed = 0
-    # Scan and unlink under the write lock: SQLite has one writer, so an
-    # open write transaction (a vault import publishes its files as it goes,
-    # then commits at the end) blocks this run instead of losing its files.
-    # The 60 s grace covers only the pre-transaction staging window.
-    # ponytail: the write lock spans the whole docs/ scan; split into
-    # scan-outside/unlink-inside if docs/ ever holds tens of thousands of files.
     try:
         with tx(conn):
-            live = {r[0] for r in conn.execute(
+            live = {_filename_key(r[0]) for r in conn.execute(
                 "SELECT body_path FROM memory_items WHERE body_path IS NOT NULL")}
             for path in docs_dir().glob("*.md"):
-                m = _BODY_FILE_RE.search(path.name)
-                if m is None or path.name in live:
+                if _filename_key(path.name) in live or _file_namespace(path.name) != own:
                     continue
-                if m.group("content") is None:
-                    continue  # pre-0.11 name: no namespace, could be any database's
-                if (m.group("ns") or "") != (f"-{ns}" if ns else ""):
-                    continue  # another database's file
                 try:
                     if time.time() - path.stat().st_mtime < 60:
                         continue
@@ -1164,60 +1160,100 @@ def gc_body_files(conn: sqlite3.Connection) -> int:
     return removed
 
 
-def mismatched_bodies(conn: sqlite3.Connection) -> list[str]:
-    """Slugs whose externalised body no longer matches the approved text.
+def _adopt_body_files(conn: sqlite3.Connection) -> None:
+    """Give a copied database its own body files (INV-12).
 
-    `verify` walks the history chain, which says nothing about a file on disk;
-    one file write changed approved words with every column and every hash in
-    the database left intact.
+    A copy's rows name the original's files, which the original's GC deletes
+    once it no longer references them. Opening the copy files a verified copy
+    under its own name, and fails rather than leave it exposed. No write lock
+    unless a row names another namespace's file.
     """
-    bad: list[str] = []
-    rows = conn.execute(
+    ns, own = _db_namespace(conn), _own_namespace(conn)
+    select = "SELECT id, slug, title, body_path, content_hash FROM memory_items " \
+             "WHERE body_path IS NOT NULL"
+
+    def foreign(row: Any) -> bool:
+        return _file_namespace(row["body_path"]) not in (None, own)
+
+    if not any(foreign(r) for r in conn.execute(select)):
+        return
+    with tx(conn):
+        for r in conn.execute(select).fetchall():   # read again under the lock
+            if not foreign(r):
+                continue
+            text = verified_body_file(r["title"], r["body_path"], r["content_hash"])
+            if text is None:
+                raise OSError(f"cannot isolate body file for {r['slug']!r}: missing or invalid")
+            _stage_body_file(conn, r["slug"], text, r["content_hash"])
+            # a repair: the text, its hash and updated_at stay (INV-03)
+            conn.execute("UPDATE memory_items SET body_path = ? WHERE id = ?", (
+                _body_filename(r["slug"], ns=ns, content_hash=r["content_hash"]),
+                r["id"]))
+
+
+def mismatched_bodies(conn: sqlite3.Connection) -> list[str]:
+    """Slugs whose externalised body no longer matches the approved text: the
+    history chain says nothing about a file on disk."""
+    return [r["slug"] for r in conn.execute(
         "SELECT slug, title, body_path, content_hash FROM memory_items "
-        "WHERE body_path IS NOT NULL AND deleted_at IS NULL"
-    ).fetchall()
-    for r in rows:
-        path = docs_dir() / r["body_path"]
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            bad.append(r["slug"])
-            continue
-        if not r["content_hash"] or _hash(r["title"], text) != r["content_hash"]:
-            bad.append(r["slug"])
-    return bad
+        "WHERE body_path IS NOT NULL AND deleted_at IS NULL").fetchall()
+        if verified_body_file(r["title"], r["body_path"], r["content_hash"]) is None]
+
+
+def verified_body_file(title: str, body_path: str, content_hash: str) -> str | None:
+    """The body file's text if it is the text ``content_hash`` was taken over,
+    else None — missing, unreadable (not UTF-8) and altered files alike.
+
+    Every reader that needs the full document asks here: load_body, verify,
+    trust, export and the history row.
+    """
+    text = _read_body_file(body_path)
+    if text is None or not content_hash:      # no hash: nothing to verify against
+        return None
+    if _matches_hash(title, text, content_hash):
+        return text
+    # written in text mode before 0.11.3 ("\r\n" on Windows), read back as "\n"
+    legacy = text.replace("\r\n", "\n").replace("\r", "\n")
+    return legacy if _matches_hash(title, legacy, content_hash) else None
 
 
 def load_body(item: "MemoryItem") -> str:
     """Return the full body, materialising from disk when externalized."""
     if not item.body_path:
         return item.body
-    path = docs_dir() / item.body_path
-    if not path.exists():
-        # Falling back to the excerpt keeps reads working, but silently serving
-        # a truncated body as if it were the whole record is exactly the kind of
-        # quiet data loss that goes unnoticed for months. Say so.
-        log.warning(
-            "body file missing for '%s' (%s) — returning the stored excerpt only",
-            item.slug, path,
-        )
-        return item.body
-    text = path.read_text(encoding="utf-8")
-    # The file is content-addressed and the row carries the hash of the text the
-    # owner approved, but nothing compared them: one file write swapped approved
-    # words underneath the approval, with trusted_at, content_hash, updated_at and
-    # the history chain all untouched. Serve the stored excerpt instead, so text
-    # nobody approved never reaches a model as a rule.
-    # an empty content_hash used to disable the comparison entirely; a row with a
-    # body file and no hash cannot be shown to a model as approved text either
-    if not item.content_hash or _hash(item.title, text) != item.content_hash:
-        log.warning(
-            "body file for '%s' does not match the approved text (%s) — "
-            "serving the stored excerpt; run `skillmem verify` and re-approve",
-            item.slug, path,
-        )
+    # A file that is missing, unreadable or not the text the row's hash was
+    # taken over is never served as the record: the excerpt is, and says so.
+    text = verified_body_file(item.title, item.body_path, item.content_hash)
+    if text is None:
+        path = docs_dir() / item.body_path
+        log.warning("body file missing for '%s' (%s) — returning the stored excerpt only"
+                    if not path.exists() else
+                    "body file for '%s' cannot be read or does not match the approved "
+                    "text (%s) — serving the stored excerpt; run `skillmem verify` "
+                    "and re-approve", item.slug, path)
         return item.body
     return text
+
+
+EXCERPT_NOTICE = ("[skillmem: excerpt only. The whole text is unavailable (its body file "
+                  "is missing or does not match this record). Do not save this back as "
+                  "the record; run `skillmem verify`.]\n\n")
+
+
+def is_excerpt(item: "MemoryItem", body: str) -> bool:
+    """Whether ``body``, as ``load_body(item)`` returned it, is the stored
+    excerpt rather than the text. Asked of the text read, never of a second
+    read of the file: a repair landing in between made an excerpt pass as the
+    whole text (INV-15)."""
+    return bool(item.body_path) and not _matches_hash(item.title, body, item.content_hash)
+
+
+def served_body(item: "MemoryItem") -> str:
+    """``load_body`` for a reader: an excerpt served in place of the text
+    says so, first, where a trimmed recall still shows it (INV-15). Without
+    it an agent's read-edit-write made the excerpt the record's text."""
+    body = load_body(item)
+    return EXCERPT_NOTICE + body if is_excerpt(item, body) else body
 
 
 ORIGINS = ("owner", "agent", "imported", "derived", "unknown")
@@ -1229,6 +1265,16 @@ def _valid_origin(origin: str | None) -> str:
 
 
 _KIND_RE = _re.compile(r"[a-z0-9_-][a-z0-9_ -]{0,31}")
+
+
+def _repaired_kind(kind) -> str:
+    """``_valid_kind`` of a kind stored before it was validated, or the
+    nearest kind it accepts: each run of refused characters a '-', cut to 32
+    ("how/to" is "how-to"); nothing left is "note"."""
+    norm = _re.sub(r"\s+", " ", str(kind or "").strip().lower())
+    if _KIND_RE.fullmatch(norm):
+        return norm
+    return _re.sub(r"[^a-z0-9_ -]+", "-", norm)[:32].strip() or "note"
 
 
 def _valid_kind(kind: str) -> str:
@@ -1250,584 +1296,413 @@ VISIBILITIES = ("public", "shared", "private")
 
 
 def _valid_visibility(visibility: str | None) -> str:
-    """One rule for every channel — HTTP validates too, MCP/CLI did not."""
-    v = (visibility or "private").strip().lower()
+    """One rule for every channel — HTTP validates too, MCP/CLI did not. An
+    empty string or null is refused; neither is "private" (INV-14)."""
+    v = str(visibility).strip().lower()
     if v not in VISIBILITIES:
         raise ValueError(f"invalid visibility {visibility!r}: one of {', '.join(VISIBILITIES)}")
     return v
 
 
 def set_trust(conn: sqlite3.Connection, slug: str, *, trusted: bool,
-              by: str = "owner", expect_hash: str | None = None) -> MemoryItem | None:
-    """Grant or withdraw the owner's approval. The only way trust is ever set.
+              by: str = "owner", expect_hash: str | None = None,
+              expect_kind: str | None = None) -> MemoryItem | None:
+    """Grant or withdraw the owner's approval, the owner's act either way.
 
-    The approval is given to the words the owner just read, so the write is
-    pinned to them: `expect_hash` (the content_hash they saw) makes an agent
-    rewrite that lands between the read and the approval fail instead of
-    silently becoming approved text. Without it, an agent could swap the body in
-    that gap and the hooks would inject its version as an owner-approved rule.
+    Approval is pinned to what the owner just read (INV-01): `expect_hash` and
+    `expect_kind` are compared under the lock, so a rewrite or a relabel that
+    lands between the read and the approval fails instead of being approved.
+    An archived record is refused: it would sit approved and out of every read.
     """
+    if not owner_present():
+        raise SealedRecord(f"approving '{slug}' or withdrawing its approval is the "
+                           f"owner's act; it needs a person at a terminal")
     with tx(conn):     # one step: read, check the text, write
         row = conn.execute(
-            "SELECT id, content_hash, lifecycle FROM memory_items "
+            "SELECT id, content_hash, kind, lifecycle FROM memory_items "
             "WHERE slug = ? AND deleted_at IS NULL",
             (slug,),
         ).fetchone()
         if not row:
             return None
         if trusted and row["lifecycle"] == "archived":
-            # the nightly sweep can retire a record between the owner reading it
-            # and approving it; approving something out of every read is not what
-            # they meant, and it would then sit approved and invisible
             raise MemoryConflict(
                 f"'{slug}' is archived and out of search, recall and the briefing; "
                 f"restore it first (`skillmem skills-archive {slug} --restore`)"
             )
-        if trusted and expect_hash is not None and row["content_hash"] != expect_hash:
+        if trusted and ((expect_hash is not None and row["content_hash"] != expect_hash)
+                        or (expect_kind is not None and row["kind"] != expect_kind)):
             raise MemoryConflict(
                 f"'{slug}' changed since you read it; review it again "
                 f"(`skillmem cat {slug}`) before approving"
             )
         if trusted:
-            conn.execute(
-                "UPDATE memory_items SET trusted_at = ?, trusted_by = ?, owner_seal = 1 "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (_now(), by, row["id"]),
-            )
+            conn.execute("UPDATE memory_items SET trusted_at = ?, trusted_by = ?, "
+                         "owner_seal = 1 WHERE id = ?", (_now(), by, row["id"]))
         else:
-            conn.execute(
-                "UPDATE memory_items SET trusted_at = NULL, trusted_by = NULL "
-                "WHERE id = ? AND deleted_at IS NULL", (row["id"],),
-            )
-    return get(conn, slug)
+            conn.execute("UPDATE memory_items SET trusted_at = NULL, trusted_by = NULL "
+                         "WHERE id = ?", (row["id"],))
+        return get(conn, slug)     # the row as written, not after the next writer's
 
 
-def _upsert_same_text(
-    conn: sqlite3.Connection, *, item: "MemoryItem", existing: Any, now: int,
-    explicit: set[str] | None, links: Iterable[str] | None,
-    restore_strength: bool, full_body: str, owner_call: bool, revive: bool,
-) -> "MemoryItem":
-    """Metadata-only update for a write whose text is byte-identical.
+# Metadata a write can name. A named field is applied as given (empty or null
+# clears it); an unnamed one keeps the row's value as read under the write lock
+# (INV-14). On insert every field takes the item's value, which the surface
+# built with its documented defaults.
+_META = frozenset({"kind", "project", "visibility", "tags", "topics", "ttl_days",
+                   "agent", "source_session", "attachments"})
+# What only a restore carries: what the record earned, when (recency clocks
+# included, which decay and the sweep read), its provenance and seal (INV-06).
+_RESTORED = frozenset({"freshness_until", "strength", "origin", "owner_seal", "updated_at",
+                       "created_at", "access_count", "confirmed_count", "failure_count",
+                       "last_accessed_at", "last_decayed_at"})
 
-    Called inside the caller's transaction: the seal check above it and this
-    write are one step.
-    """
-    # Same text — no history entry, and the owner's approval survives because
-    # it was given to these words. But metadata may still have changed, and
-    # returning the old row unchanged reported success for a write that never
-    # happened.
-    meta = {
-        "project": item.project, "visibility": item.visibility,
-        "kind": item.kind, "ttl_days": item.ttl_days,
-    }
-    if explicit is None:
-        changed = {k: v for k, v in meta.items()
-                   if v is not None and v != existing[k]}
-        if item.agent is not None and item.agent != existing["agent"]:
-            changed["agent"] = item.agent
-        if restore_strength and item.origin and _valid_origin(item.origin) != existing["origin"]:
-            # only a RESTORE (a skillmem dump) rewrites provenance on same
-            # text; an ordinary library write with the default "unknown",
-            # or a migrate of a hand-written file, must not relabel a row
-            changed["origin"] = _valid_origin(item.origin)
-    else:
-        changed = {k: v for k, v in meta.items()
-                   if k in explicit and v is not None and v != existing[k]}
-        if "ttl_days" in explicit and item.ttl_days is None and existing["ttl_days"] is not None:
-            changed["ttl_days"] = None    # an explicit null clears the TTL (HTTP sends it as such)
-    tags, topics = _json_list(item.tags), _json_list(item.topics)
-    tags_given = ("tags" in explicit) if explicit is not None else bool(item.tags)
-    topics_given = ("topics" in explicit) if explicit is not None else bool(item.topics)
-    if tags_given and tags != existing["tags"]:
-        changed["tags"] = tags
-    if topics_given and topics != existing["topics"]:
-        changed["topics"] = topics
-    if revive and existing["deleted_at"] is not None:
-        changed["deleted_at"] = None
-    if "ttl_days" in changed:
-        # a new TTL is a new deadline; storing ttl_days alone left
-        # freshness_until as it was and the expiry never came
-        ttl = changed["ttl_days"]
-        changed["freshness_until"] = now + ttl * 86400 if ttl else None
-    if "tags" in changed or "topics" in changed:
-        # tags/topics are part of the lexical index — a tag added to an
-        # unchanged body must be searchable, so the stems follow. Built
-        # from the RESULTING metadata: a field not supplied keeps the
-        # row's value, one supplied (even empty) replaces it.
-        eff_tags = item.tags if tags_given else _parse_json_list(existing["tags"])
-        eff_topics = item.topics if topics_given else _parse_json_list(existing["topics"])
-        changed["stemmed"] = _stem_text(
-            f"{item.title}\n{full_body}\n" + " ".join(eff_tags + eff_topics)
-        )
-    if restore_strength and item.strength != existing["strength"]:
-        changed["strength"] = item.strength   # an explicit restore applies to same text too
-    if changed:
-        changed["updated_at"] = now
-    # The owner writing the same text is still the owner writing it: the seal
-    # belongs to both branches, and it used to be set only when the caller
-    # passed no explicit field set — which no real caller does. The insert
-    # branch asks owner_present() before minting the seal on origin='owner'
-    # (a file an agent can write reaches this path too); this branch must
-    # ask the same question, or a non-TTY vault import can seal a record it
-    # then hides behind archived state.
-    if (_valid_origin(item.origin) == "owner" and owner_present()) or item.trusted_at:
-        changed["owner_seal"] = 1
-    # The CLI-supplied `trusted_at`/`trusted_by` was silently dropped here on
-    # same-text writes: an agent-written row rewritten by the owner with
-    # identical words ended up sealed but unapproved. The write from a
-    # terminal is the approval; apply it to the row the way the insert branch
-    # applies it via the INSERT column list. The three-way condition mirrors
-    # `_upsert_update_tx` — origin, TTY, and a caller-supplied stamp all
-    # required, so an agent surface passing origin='owner' by mistake cannot
-    # move approval.
-    if (
-        _valid_origin(item.origin) == "owner"
-        and owner_present()
-        and item.trusted_at is not None
-    ):
-        changed["trusted_at"] = item.trusted_at
-        changed["trusted_by"] = item.trusted_by
-    if changed:
-        sets = ", ".join(f"{k} = ?" for k in changed)
-        conn.execute(f"UPDATE memory_items SET {sets} WHERE id = ?",
-                     (*changed.values(), existing["id"]))
-        if links is not None:
-            _replace_links_inner(conn, item.slug, links)
-        return get(conn, item.slug) or MemoryItem.from_row(existing)
-    return MemoryItem.from_row(existing)
+# INVARIANTS.md §2 as data: the fields each surface can name at all, and the
+# powers only some surfaces have.
+#   agents:   only agents write through it: the owner is never present, even
+#             when the server happens to run in the owner's terminal
+#   approves: the owner writing through it at a terminal approves the text (INV-01)
+#   restores: a skillmem dump is the whole record: it may reassign the author
+#             (C7) and write over an archived row, whose lifecycle it carries (K1)
+# Otherwise trust, the seal and a sealed row change only with the owner, which
+# each mutation asks itself through _owner(surface); no caller votes on it
+# (INV-02, INV-03).
+SURFACES: dict[str, dict[str, Any]] = {
+    "cli":     {"names": {"kind", "project", "ttl_days", "agent", "tags"}, "approves": True},
+    "mcp":     {"names": {"kind", "project", "visibility", "tags", "topics", "ttl_days"},
+                "agents": True},
+    "http":    {"names": {"kind", "project", "visibility", "tags", "topics", "ttl_days"},
+                "agents": True},
+    "dump":    {"names": _META | _RESTORED, "restores": True},
+    "note":    {"names": _META | {"strength"}},
+    "migrate": {"names": {"kind", "source_session"}},
+    "pack":    {"names": {"kind", "project", "agent", "visibility", "tags", "topics"},
+                "agents": True},
+    "library": {"names": _META | _RESTORED},
+}
+
+
+
+def _owner(surface: str) -> bool:
+    """The owner signal as a mutation arriving through ``surface`` sees it. A
+    surface only agents write through never has the owner, whatever terminal
+    the server runs in; every mutation that spares the owner's rows asks here."""
+    return not SURFACES[surface].get("agents") and owner_present()
+
+
+_LIST_COLUMNS = ("tags", "topics", "attachments")
+
+
+def _column(item: MemoryItem, key: str) -> Any:
+    """``item.<key>`` as the memory_items column stores it."""
+    value = getattr(item, key)
+    if key in _LIST_COLUMNS:
+        return _json_list(value)
+    if key == "origin":
+        return _valid_origin(value)
+    if key == "owner_seal":
+        return 1 if value else 0
+    if value == "" and key in ("project", "agent", "source_session"):
+        return None     # one "none", as a dump round-trips it (INV-06)
+    return value
 
 
 def upsert(
     conn: sqlite3.Connection,
     item: MemoryItem,
     *,
+    surface: str = "library",
+    explicit: Iterable[str] = (),
     reason: str | None = None,
     force: bool = False,
     check_conflicts: bool = False,
     conflict_filter: Callable[[dict[str, Any]], bool] | None = None,
-    links: Iterable[str] | None = None,
-    restore_strength: bool = False,
-    explicit: set[str] | None = None,
     revive: bool = False,
     actor: str | None = None,
-    owner_call: bool = False,
+    create_only: bool = False,
+    kind_only: str | None = None,
 ) -> MemoryItem:
-    """Insert or update ``item`` by slug; returns the same (mutated) object.
+    """The one write: insert ``item`` or update the row holding its slug.
 
-    NOTE: ``item`` is mutated in place — title/body are scrubbed, and when the
-    body is large enough to be externalized to a file, ``item.body`` is
-    replaced with the short excerpt (``item.body_path`` then points at the
-    full text; use ``load_body`` to read it back). Keep your own copy of the
-    original body if you need it after the call.
+    ``surface`` names the caller (a key of SURFACES) and ``explicit`` the fields
+    its caller actually supplied. Everything after validation happens in one
+    transaction: the row is read under the write lock, every refusal is decided
+    on that read, the field policy is applied, the row and its history entry are
+    written. The embedding is computed after the outermost COMMIT (see tx).
 
-    ``strength`` is evidence the row earned; an ordinary update keeps it. Only
-    an explicit restore passes ``restore_strength=True`` (a vault import of a
-    skillmem dump, or a file carrying a strength) — before that, every
-    force-overwrite and every pack re-import silently reset it to 1.0.
+    Refused: a slug that exists when ``create_only``; a tombstone unless
+    ``revive``; a live row of another kind than ``kind_only``; an archived row
+    (restore it first), except by a restore; different text without ``reason``
+    or ``force``; any change to a sealed row without the owner at a terminal;
+    a new author on an existing row, except by a restore or the owner.
 
-    ``explicit`` names the metadata fields the caller actually supplied
-    (``{"kind", "visibility", "tags", ...}``). On a same-text write only those
-    are applied — so a retried ``mem_write`` without a ``kind`` no longer turns
-    a trusted skill into a note, and an explicit ``topics=[]`` really clears
-    the audience. ``None`` keeps the library-level behaviour (every non-empty
-    field applies); ``agent`` is never applied to an existing row by a create.
-
-    A soft-deleted slug is refused unless ``revive=True`` (a restore or a pack
-    reinstall), so a write is never acknowledged and then invisible.
+    ``item`` becomes the stored row: title and body scrubbed, a long body
+    replaced by its excerpt (``load_body`` reads the whole text back).
     """
+    policy = SURFACES[surface]
+    named = set(explicit)
+    if named - policy["names"]:
+        raise ValueError(f"{surface} cannot set {', '.join(sorted(named - policy['names']))}")
+    if not (item.slug or "").strip():
+        raise ValueError("slug is required")   # `write --slug ""` stored a record nothing could address
     item.kind = _valid_kind(item.kind)
     item.visibility = _valid_visibility(item.visibility)
-    if item.ttl_days is not None and not (1 <= int(item.ttl_days) <= 3650):
+    # INV-14: each field is exactly its type (a bool is not a TTL, a mapping not tags)
+    if item.ttl_days is not None and (type(item.ttl_days) is not int
+                                      or not 1 <= item.ttl_days <= 3650):
         raise ValueError(f"invalid ttl_days {item.ttl_days!r}: 1..3650")
+    for key in ("tags", "topics", "attachments"):
+        value = getattr(item, key)
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValueError(f"invalid {key} {value!r}: a list of strings")
+    for key in ("project", "agent", "source_session"):
+        if not isinstance(getattr(item, key), (str, type(None))):
+            raise ValueError(f"invalid {key} {getattr(item, key)!r}: a string")
+    if isinstance(item.strength, bool) or not 0 <= float(item.strength) <= STRENGTH_CAP:
+        # above the cap, the next reinforcement "capped" a rule down (INV-03)
+        raise ValueError(f"invalid strength {item.strength!r}: 0..{STRENGTH_CAP}")
     item.title = scrub(item.title)
-    item.body = scrub(item.body)
-    item.wordcount = _wordcount(item.body)
-    item.content_hash = _hash(item.title, item.body)
-    now = _now()
+    full_body = scrub(item.body)
+    content_hash = _hash(item.title, full_body)
 
-    # Decide externalization (no I/O yet). The actual file write happens inside
-    # the transaction so a SQL failure rolls everything back.
-    full_body = item.body
-    externalize = _should_externalize(item)
-    if externalize:
-        item.body_path = _body_filename(item.slug, ns=_db_namespace(conn),
-                                        content_hash=item.content_hash)
-        item.body = _make_excerpt(full_body)
-    else:
-        item.body_path = None
+    if check_conflicts and not force and conn.execute(
+            "SELECT 1 FROM memory_items WHERE slug = ?", (item.slug,)).fetchone() is None:
+        # advisory, so outside the lock: the FTS scan must not hold other writers
+        conflicts = find_conflicts(conn, item.title, _make_excerpt(full_body),
+                                   visible=conflict_filter)
+        if conflicts:
+            raise MemoryConflict(
+                "duplicate-candidates:" + json.dumps(conflicts, ensure_ascii=False))
 
-    stemmed = _stem_text(
-        f"{item.title}\n{full_body}\n" + " ".join(item.tags + item.topics)
-    )
-
-    existing = conn.execute(
-        "SELECT * FROM memory_items WHERE slug = ?", (item.slug,)
-    ).fetchone()
-
-    if existing is not None and existing["deleted_at"] is not None and not revive:
-        # A tombstone is still a record. Writing onto it used to be acknowledged
-        # ("OK: slug") while the row stayed invisible to every reader.
-        raise MemoryConflict(
-            f"slug '{item.slug}' belongs to a deleted record; restore it "
-            f"(revive) or pick another slug"
-        )
-
-    if (existing is not None and existing["deleted_at"] is not None
-            and revive and existing["owner_seal"] and not owner_call):
-        # Reviving a sealed tombstone with agent-supplied title and body was the
-        # import-vault hole from round 12: `_is_auto_memory(meta)` set revive=True
-        # unconditionally, and a forged .md file brought an owner-deleted rule
-        # back with replacement text. The seal survives delete, so the resurrected
-        # row would appear as an owner-approved rule to every reader. Refuse the
-        # revive; the CLI's own terminal gate makes owner_call=True the norm.
-        raise SealedRecord(
-            f"'{item.slug}' is a deleted owner record; reviving it needs a "
-            f"person at a terminal (skillmem import-vault, run it yourself)"
-        )
-
-    if existing is None:
-        # Conflict check runs BEFORE the transaction so we hold no write lock
-        # while we're scanning FTS5 — keeps concurrent searchers responsive.
-        if check_conflicts and not force:
-            conflicts = find_conflicts(conn, item.title, item.body, visible=conflict_filter)
-            if conflicts:
-                raise MemoryConflict(
-                    "duplicate-candidates:" + json.dumps(conflicts, ensure_ascii=False)
-                )
-        if item.ttl_days and not item.freshness_until:
-            item.freshness_until = now + item.ttl_days * 86400
-        if not item.created_at:
-            item.created_at = now
-        item.updated_at = now
-
-        staged = (_stage_body_file(conn, item.slug, full_body, item.content_hash)
-                  if externalize else None)
-        try:
-            with tx(conn):
-                cur = conn.execute(
-                    """
-                    INSERT INTO memory_items (
-                        slug, kind, title, body, body_path, stemmed, project, tags,
-                        topics, visibility, agent, source_session, attachments, ttl_days,
-                        freshness_until, wordcount, content_hash, supersedes_id,
-                        confidence, strength, origin, trusted_at, trusted_by,
-                        owner_seal, created_at, updated_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        item.slug, item.kind, item.title, item.body, item.body_path,
-                        stemmed, item.project,
-                        _json_list(item.tags), _json_list(item.topics), item.visibility,
-                        item.agent, item.source_session, _json_list(item.attachments),
-                        item.ttl_days, item.freshness_until,
-                        item.wordcount, item.content_hash, item.supersedes_id,
-                        item.confidence, item.strength,
-                        _valid_origin(item.origin), item.trusted_at, item.trusted_by,
-                        # The seal is minted here and nowhere else, so the owner
-                        # signal is asked here. origin='owner' alone is not enough:
-                        # a file an agent can write (a dump, a markdown source)
-                        # reaches this path, and a minted seal makes the record
-                        # undecayable and undeletable for good.
-                        1 if ((_valid_origin(item.origin) == "owner"
-                               and owner_present()) or item.trusted_at) else 0,
-                        item.created_at, item.updated_at,
-                    ),
-                )
-                item.id = cur.lastrowid
-                if links is not None:
-                    _replace_links_inner(conn, item.slug, links)
-        except sqlite3.IntegrityError as exc:
-            _discard_body_file(conn, staged)
-            # Another writer inserted this slug between our existence check and
-            # this INSERT. That is the same situation the pre-check reports as a
-            # conflict, so callers should see the same exception — not a raw
-            # driver error they have no reason to special-case.
-            if "memory_items.slug" in str(exc) or "UNIQUE" in str(exc).upper():
-                raise MemoryConflict(
-                    f"slug '{item.slug}' was created concurrently by another writer"
-                ) from exc
-            raise
-        except BaseException:
-            _discard_body_file(conn, staged)
-            raise
-        if staged is not None:
-            _publish_body_file(staged)
-        _set_embedding(conn, item.id, item.title, full_body)
-        return item
-
-    if existing["content_hash"] == item.content_hash:
-        # Same text, so no history row — but the seal check and the metadata
-        # UPDATE still have to be one step. The owner approving (and sealing) the
-        # record between the read above and the write below used to be ignored,
-        # and the relabel went through anyway.
-        with tx(conn):
-            sealed_now = conn.execute(
-                "SELECT owner_seal, kind, content_hash FROM memory_items "
-                "WHERE id = ? AND deleted_at IS NULL", (existing["id"],)
-            ).fetchone()
-            if (sealed_now is not None
-                    and sealed_now["content_hash"] != existing["content_hash"]):
-                # the text changed between the caller's read and this lock, so
-                # this is no longer a same-text write at all
-                raise MemoryConflict(
-                    f"slug '{item.slug}' changed while it was being written; "
-                    f"read it again"
-                )
-            if sealed_now is None and not revive:
-                # the row went away between the read and this lock; failing open
-                # here let a sealed record's kind change on the way out. A revive
-                # (a pack reinstall, a dump restoring a deleted slug) reads None
-                # legitimately, because the row it is bringing back is a tombstone.
-                raise MemoryConflict(
-                    f"slug '{item.slug}' disappeared while it was being written "
-                    f"(deleted concurrently); nothing was stored"
-                )
-            if (sealed_now is not None and not owner_call and sealed_now["owner_seal"]
-                    and _kind_is_a_change(item, sealed_now, explicit)):
+    owner = _owner(surface)
+    with tx(conn):
+        row = conn.execute("SELECT * FROM memory_items WHERE slug = ?",
+                           (item.slug,)).fetchone()
+        same_text = (row is not None and row["title"] == item.title
+                     and _matches_hash(item.title, full_body, row["content_hash"]))
+        if same_text:
+            # Keep legacy approvals and body names on a true no-op or repair.
+            # A text change always uses the unambiguous hash above.
+            content_hash = row["content_hash"]
+        if row is not None:
+            _refuse(item.slug, row, policy, create_only=create_only, revive=revive,
+                    kind_only=kind_only, same_text=same_text, reason=reason, force=force)
+        now = _now()
+        new = _resolve(conn, item, row, named, policy, owner=owner, now=now,
+                       full_body=full_body, content_hash=content_hash,
+                       same_text=same_text, revive=revive)
+        # the links are the stored text's words, not a caller's list: taken
+        # from the raw body they kept what scrub removed, past approval (INV-07)
+        _replace_links_inner(conn, item.slug, extract_wikilinks(full_body))
+        if row is None:
+            conn.execute(
+                f"INSERT INTO memory_items ({', '.join(new)}) "
+                f"VALUES ({', '.join('?' * len(new))})", tuple(new.values()))
+        else:
+            changed = {k: v for k, v in new.items() if v != row[k]}
+            # a body file repair or a rebuilt lexical index: same text, same record
+            repair = same_text and changed.keys() <= _REPAIR
+            if changed and row["owner_seal"] and not owner and not repair:   # INV-03
                 raise SealedRecord(
-                    f"'{item.slug}' is the owner's record; an agent cannot change "
-                    f"its kind from {sealed_now['kind']} to {item.kind} (the session "
-                    f"briefing selects by kind). Edit the text instead, or ask the owner."
-                )
-            return _upsert_same_text(
-                conn, item=item, existing=existing, now=now, explicit=explicit,
-                links=links, restore_strength=restore_strength,
-                full_body=full_body, owner_call=owner_call, revive=revive,
-            )
-
-    if not owner_call and existing["owner_seal"] and _kind_is_a_change(item, existing, explicit):
-        # A text change goes through _upsert_update_tx, which re-reads under its
-        # own lock; this pre-check gives the caller the same message without
-        # staging a body file first.
-        raise SealedRecord(
-            f"'{item.slug}' is the owner's record; an agent cannot change its kind "
-            f"from {existing['kind']} to {item.kind} (the session briefing selects "
-            f"by kind). Edit the text instead, or ask the owner."
-        )
-
-    if not reason and not force:
-        # this reaches the CLI, MCP and HTTP alike, and the create surfaces
-        # (mem_write, mem_learn) carry neither reason= nor force=; name the
-        # action, not a parameter the caller may not have
-        raise MemoryConflict(
-            f"slug '{item.slug}' already exists with different text; "
-            f"overwrite it through an explicit update, or pick another slug"
-        )
-
-    old_path = existing["body_path"] if "body_path" in existing.keys() else None
-    old_body = existing["body"]
-    if old_path:
-        old_full = docs_dir() / old_path
-        if old_full.exists():
-            try:
-                old_body = old_full.read_text(encoding="utf-8")
-            except OSError as exc:
-                log.warning("could not read old body for history: %s", exc)
-
-    freshness = item.freshness_until
-    if item.ttl_days and not freshness:
-        freshness = now + item.ttl_days * 86400
-
-    # Content-addressed: the new file has its own name, the old one survives
-    # any rollback untouched (see _stage_body_file).
-    staged = (_stage_body_file(conn, item.slug, full_body, item.content_hash)
-              if externalize else None)
-    try:
-        _upsert_update_tx(
-            conn, item=item, existing=existing, now=now, reason=reason,
-            stemmed=stemmed, freshness=freshness, old_body=old_body, links=links,
-            strength=item.strength if restore_strength else None,
-            revive=revive, actor=actor, owner_call=owner_call, explicit=explicit,
-        )
-    except BaseException:
-        _discard_body_file(conn, staged)
-        raise
-
-    # The previous body file is NOT deleted here: an outer transaction (vault
-    # import) may still roll this update back, and then the row needs it.
-    # gc_body_files() removes unreferenced files on the nightly run.
-
-    item.id = existing["id"]
-    item.created_at = existing["created_at"]
-    item.updated_at = now
-    item.freshness_until = freshness
-    if not restore_strength:
-        item.strength = existing["strength"]   # what the row keeps, not the caller's default
-    _set_embedding(conn, item.id, item.title, full_body)
+                    f"'{item.slug}' is the owner's record (written or approved by "
+                    f"them); only the owner changes it. Write a proposal under a "
+                    f"new slug instead.")
+            if "agent" in changed and not (owner or policy.get("restores")):
+                raise MemoryConflict(
+                    f"'{item.slug}' was written by {row['agent']!r}; only the owner "
+                    f"at a terminal reassigns authorship")
+            if not changed:
+                item.__dict__.update(MemoryItem.from_row(row).__dict__)
+                return item
+            if not same_text:
+                _append_history(conn, row, now, actor or item.agent,
+                                reason or "force overwrite")
+                changed["embedding"] = None   # it described the old text
+            elif "deleted_at" in changed:     # a revive is a transition (INV-13)
+                _append_history(conn, row, now, actor or item.agent,
+                                "restored from deleted")
+            # a restore names the age it brings back, even when it equals the row's;
+            # a repair is not an edit, and moving the age made a stale rule fresh
+            if not repair:
+                changed.setdefault("updated_at", new.get("updated_at", now))
+            sets = ", ".join(f"{k} = ?" for k in changed)
+            conn.execute(f"UPDATE memory_items SET {sets} WHERE id = ?",
+                         (*changed.values(), row["id"]))
+        stored = conn.execute("SELECT * FROM memory_items WHERE slug = ?",
+                              (item.slug,)).fetchone()
+        if not same_text:
+            _set_embedding(conn, stored["id"], item.title, full_body, content_hash)
+    item.__dict__.update(MemoryItem.from_row(stored).__dict__)
     return item
 
 
-def _upsert_update_tx(
-    conn: sqlite3.Connection, *, item: "MemoryItem", existing: Any, now: int,
-    reason: str | None, stemmed: str, freshness: int | None, old_body: str,
-    links: list[str] | None, strength: float | None = None, revive: bool = False,
-    actor: str | None = None, owner_call: bool = False,
-    explicit: set[str] | None = None,
-) -> None:
-    with tx(conn):
-        # Re-read inside the lock for the history row only: `existing` was
-        # fetched before the transaction, so two concurrent updates both recorded
-        # the same previous text and the intermediate version vanished from
-        # history while the chain still verified.
-        fresh = conn.execute(
-            "SELECT title, body, body_path, kind, owner_seal, content_hash "
-            "FROM memory_items WHERE id = ?",
-            (existing["id"],),
-        ).fetchone()
-        if (fresh is not None and not owner_call and fresh["owner_seal"]
-                and _kind_is_a_change(item, fresh, explicit)):
-            # the owner approved (and sealed) the record after the caller's read:
-            # the pre-check outside this lock could not have seen it
-            raise SealedRecord(
-                f"'{item.slug}' is the owner's record; an agent cannot change its "
-                f"kind from {fresh['kind']} to {item.kind} (the session briefing "
-                f"selects by kind). Edit the text instead, or ask the owner."
-            )
-        hist_title = fresh["title"] if fresh is not None else existing["title"]
-        if fresh is None:
-            hist_body = old_body
-        elif fresh["body_path"]:
-            # An externalised body lives in a file, and `old_body` was read
-            # before the lock: two concurrent updates both recorded the older
-            # version as predecessor, and the middle one was then GC'd off disk.
-            disk = _read_body_file(fresh["body_path"])
-            # A file that does not match the hash THIS ROW carries, read in this
-            # same lock, is not the previous version of anything: recording it
-            # would sign someone else's text into the chain, and comparing
-            # against the pre-transaction row missed both a title change and a
-            # concurrent update.
-            if disk is not None and _hash(fresh["title"], disk) == fresh["content_hash"]:
-                hist_body = disk
-            else:
-                # the file failed its hash: `old_body` was read from that same
-                # file by the caller, so falling back to it signs the rejected
-                # text in anyway. The row's own excerpt is the honest record.
-                hist_body = fresh["body"]
-        else:
-            hist_body = fresh["body"]
-        prev_hash = _last_chain_hash(conn)
-        now = _chain_clock(conn, now)
-        history_payload = {
-            "slug": existing["slug"], "old_title": hist_title,
-            "old_body": hist_body, "changed_at": now,
-            # the surface stamps itself; item.agent is caller-supplied text
-            "changed_by": actor or item.agent, "reason": reason or "force overwrite",
-        }
-        self_hash = _chain_hash(prev_hash, history_payload)
-        conn.execute(
-            """
-            INSERT INTO memory_history (
-                slug, old_title, old_body, changed_at, changed_by, reason,
-                prev_hash, self_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                existing["slug"], hist_title, hist_body,
-                now, actor or item.agent, reason or "force overwrite",
-                prev_hash, self_hash,
-            ),
-        )
-        # Two related-but-distinct owner signals here:
-        #  * `should_seal` mints the seal the way the insert branch does —
-        #    origin=owner + a terminal, OR a caller-supplied trust stamp.
-        #  * `owner_writing` is the stricter three-way signal (origin, terminal,
-        #    AND stamp) that says the write itself carries approval; that's
-        #    the only combination that keeps `trusted_at` on the row instead
-        #    of clearing it, because a text change without an owner stamp
-        #    must fall back to unapproved.
-        should_seal = (
-            (_valid_origin(item.origin) == "owner" and owner_present())
-            or item.trusted_at
-        )
-        owner_writing = (
-            _valid_origin(item.origin) == "owner"
-            and owner_present()
-            and item.trusted_at is not None
-        )
-        main_update = conn.execute(
-            """
-            UPDATE memory_items SET
-                -- the owner writing over a record seals it; nothing clears it
-                owner_seal = CASE WHEN ? THEN 1 ELSE owner_seal END,
-                -- only a kind the caller actually named: the guard exempts an
-                -- omitted one, and writing the dataclass default here relabelled
-                -- the record anyway — the same disappearance by another route
-                kind = CASE WHEN ? THEN ? ELSE kind END, title = ?, body = ?, body_path = ?, stemmed = ?, project = ?,
-                tags = ?, topics = ?, visibility = ?, agent = ?, source_session = ?,
-                attachments = ?, ttl_days = ?, freshness_until = ?, wordcount = ?,
-                content_hash = ?, supersedes_id = ?, confidence = ?,
-                strength = COALESCE(?, strength),
-                origin = ?,
-                -- Approval belongs to the text that was approved. An agent
-                -- overwriting the body clears it. The owner writing new text
-                -- through a terminal IS the approval, so the CLI-minted stamp
-                -- rides in on the same UPDATE — otherwise the owner's own rule
-                -- filed itself under `awaiting_reapproval` until a separate
-                -- `skillmem trust` ran, and dropped out of the briefing.
-                trusted_at = CASE WHEN ? THEN ? ELSE NULL END,
-                trusted_by = CASE WHEN ? THEN ? ELSE NULL END,
-                deleted_at = CASE WHEN ? THEN NULL ELSE deleted_at END,
-                updated_at = ?
-            -- the row may have been soft-deleted after the caller's read: the
-            -- tombstone check above runs outside this lock, and a write that
-            -- lands on a deleted row is acknowledged and then invisible
-            WHERE id = ? AND (deleted_at IS NULL OR ?)
-            """,
-            (
-                1 if should_seal else 0,
-                1 if (explicit is None or "kind" in explicit) else 0, item.kind,
-                item.title, item.body, item.body_path, stemmed, item.project,
-                _json_list(item.tags), _json_list(item.topics),
-                item.visibility, item.agent, item.source_session,
-                _json_list(item.attachments),
-                item.ttl_days, freshness, item.wordcount, item.content_hash,
-                item.supersedes_id, item.confidence, strength,
-                _valid_origin(item.origin),
-                1 if owner_writing else 0, item.trusted_at,
-                1 if owner_writing else 0, item.trusted_by,
-                1 if revive else 0, now,
-                existing["id"], 1 if revive else 0,
-            ),
-        )
-        if main_update.rowcount == 0:
-            # deleted (or otherwise gone) between the read and this write: the
-            # row is not there, and reporting success left the caller believing
-            # text was stored that no read will ever return
+def upsert_skill(conn: sqlite3.Connection, item: MemoryItem, **kw: Any) -> MemoryItem:
+    """``upsert`` for a learned skill: every learn surface (CLI, MCP, HTTP)
+    comes through here, and a slug holding another kind is refused. The verb
+    names the kind (INV-01)."""
+    kw["explicit"] = {*kw.get("explicit", ()), "kind"}
+    return upsert(conn, item, kind_only="skill", **kw)
+
+
+# Columns that hold the text or index it, not describe it: a same-text write
+# changing only these repairs the row (INV-03).
+_REPAIR = frozenset({"body", "body_path", "stemmed"})
+
+
+def _refuse(slug: str, row: Any, policy: dict[str, Any], *, create_only: bool,
+            revive: bool, kind_only: str | None, same_text: bool,
+            reason: str | None, force: bool) -> None:
+    """Every refusal of a write to an existing row, decided on the row read
+    under the write lock."""
+    if create_only:     # the caller's permission check saw the slug free
+        raise MemoryConflict(f"slug '{slug}' was created concurrently by another writer")
+    if row["deleted_at"] is not None:
+        if not revive:      # a tombstone is still a record (INV-08)
             raise MemoryConflict(
-                f"slug '{item.slug}' disappeared while it was being written "
-                f"(deleted concurrently); nothing was stored"
-            )
-        if links is not None:
-            _replace_links_inner(conn, item.slug, links)
-
-
-def _set_embedding(conn: sqlite3.Connection, item_id: int | None, title: str, body: str) -> None:
-    """Best-effort embedding write — runs OUTSIDE the main write tx.
-
-    Kept off the hot insert/update path so a slow/cold model load never holds
-    the write lock, and a missing/broken embedder never blocks a memory write.
-    A row left without an embedding simply falls back to BM25 at recall time;
-    ``reindex-embeddings`` can backfill it later.
-    """
-    if item_id is None:
+                f"slug '{slug}' belongs to a deleted record; restore it "
+                f"(revive) or pick another slug")
         return
+    if kind_only and row["kind"] != kind_only:
+        raise MemoryConflict(f"slug '{slug}' already holds a {row['kind']}; "
+                             f"pick another slug or update it instead")
+    if row["lifecycle"] == "archived" and not policy.get("restores"):
+        # found by no read (INV-08), and un-archiving is the owner's act
+        raise MemoryConflict(
+            f"'{slug}' is archived; restore it first (skillmem skills-restore {slug})")
+    if not same_text and not (reason or force):
+        raise MemoryConflict(
+            f"slug '{slug}' already exists with different text; "
+            f"overwrite it through an explicit update, or pick another slug")
+
+
+def _resolve(conn: sqlite3.Connection, item: MemoryItem, row: Any, named: set[str],
+             policy: dict[str, Any], *, owner: bool, now: int, full_body: str,
+             content_hash: str, same_text: bool, revive: bool) -> dict[str, Any]:
+    """The columns this write sets. On insert, every one; on an update, what
+    the caller named, what the text carries, and what ownership decides."""
+    # the origin this write states: the item's, unless a surface that can
+    # name it left it out; then the row keeps its own, and it mints no seal (INV-14)
+    origin = (_valid_origin(item.origin) if row is None or "origin" in named
+              or "origin" not in policy["names"] else None)
+    if row is None:
+        new = {k: _column(item, k) for k in (
+            _META | {"strength", "origin"})}
+        # a birth date and a deadline only from a surface that restores them
+        # (INV-14); a named value is the value, null and 0 too (INV-06)
+        restores = policy["names"] >= {"created_at", "freshness_until"}
+        new.update(freshness_until=item.freshness_until if "freshness_until" in named else (
+                       item.freshness_until if restores else None) or (
+                       now + item.ttl_days * 86400 if item.ttl_days else None),
+                   created_at=item.created_at if "created_at" in named else (
+                       item.created_at if restores else None) or now,
+                   updated_at=item.updated_at if "updated_at" in named else now)
+        for k in ("access_count", "confirmed_count", "failure_count",
+                  "last_accessed_at", "last_decayed_at"):
+            if k in named:
+                new[k] = getattr(item, k)
+    else:
+        new = {k: _column(item, k) for k in named
+               if k not in ("freshness_until", "owner_seal", "updated_at")}
+        if not same_text and origin:
+            new["origin"] = origin   # origin describes the text
+        # the deadline goes with the TTL; one the caller names is the deadline,
+        # null too (it clears it), or it was acknowledged and dropped
+        if "freshness_until" in named:
+            new["freshness_until"] = item.freshness_until
+        elif "ttl_days" in named and (item.ttl_days != row["ttl_days"] or not same_text):
+            new["freshness_until"] = now + item.ttl_days * 86400 if item.ttl_days else None
+        if "updated_at" in named:
+            new["updated_at"] = item.updated_at
+        if revive and row["deleted_at"] is not None:    # back live and visible (INV-08)
+            new.update(deleted_at=None, lifecycle="active")
+
+    def eff(k: str) -> Any:
+        return new[k] if k in new else row[k]
+
+    body_path = (_body_filename(item.slug, ns=_db_namespace(conn), content_hash=content_hash)
+                 if _body_in_file(eff("kind"), full_body) else None)
+    if body_path and (row is None or row["body_path"] != body_path
+                      or _read_body_file(body_path) != full_body):
+        _stage_body_file(conn, item.slug, full_body, content_hash)
+    new["body_path"] = body_path
+    if not same_text or body_path != row["body_path"]:
+        new["body"] = _make_excerpt(full_body) if body_path else full_body
+    if not same_text:
+        new.update(title=item.title, content_hash=content_hash,
+                   wordcount=_wordcount(full_body))
+    if not same_text or {"tags", "topics"} & named:
+        # tags and topics are in the lexical index, as the row will have them
+        new["stemmed"] = _stem_text(f"{item.title}\n{full_body}\n" + " ".join(
+            _parse_json_list(eff("tags")) + _parse_json_list(eff("topics"))))
+
+    # Approval belongs to the text and kind approved (INV-01): the owner writing
+    # at a terminal through a surface that approves is the approval; any other
+    # change of either clears it. A kind the write does not name is approved
+    # only if it already was: the owner never saw an agent's label.
+    if policy.get("approves") and owner and (
+            row is None or "kind" in named or row["trusted_at"] is not None):
+        if row is None or not same_text or row["trusted_at"] is None:
+            new.update(trusted_at=now, trusted_by="cli-tty")
+    elif row is None or not same_text or eff("kind") != row["kind"]:
+        new.update(trusted_at=None, trusted_by=None)
+    # The seal is minted only with the owner at a terminal (INV-02) and never
+    # cleared; a caller that names it (a dump) gets that one, not the origin's (INV-06).
+    if owner and (item.owner_seal if "owner_seal" in named
+                  else origin == "owner"):
+        new["owner_seal"] = 1
+    elif row is None:
+        new["owner_seal"] = 0
+    if row is None:
+        new["slug"] = item.slug
+    return new
+
+
+def _append_history(conn: sqlite3.Connection, row: Any, now: int,
+                    changed_by: str | None, reason: str) -> None:
+    """The one history row: the version a text change, delete or lifecycle
+    move replaces, as read under the write lock (INV-13). ``row`` carries
+    slug, title, body, body_path and content_hash. An externalised body is its
+    verified file, else the excerpt, saying so as `served_body` does (INV-15)."""
+    old_body = row["body"]
+    if row["body_path"]:
+        old_body = (text if (text := verified_body_file(row["title"], row["body_path"], row["content_hash"]))
+                    is not None else EXCERPT_NOTICE + old_body)
+    prev_hash = _last_chain_hash(conn)
+    entry = {"slug": row["slug"], "old_title": row["title"], "old_body": old_body,
+             "changed_at": _chain_clock(conn, now), "changed_by": changed_by, "reason": reason}
+    conn.execute(
+        "INSERT INTO memory_history (slug, old_title, old_body, changed_at, changed_by,"
+        " reason, prev_hash, self_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (*entry.values(), prev_hash, _chain_hash(prev_hash, entry)))
+
+
+def _set_embedding(conn: sqlite3.Connection, item_id: int | None, title: str, body: str,
+                   content_hash: str) -> bool:
+    """Best-effort embedding write, never under the write lock (INV-09): inside
+    a transaction it waits for tx() to commit. A row without one falls back to
+    BM25; ``reindex-embeddings`` backfills it."""
+    if item_id is None:
+        return False
+    if conn.in_transaction:
+        _deferred_embeddings.setdefault(id(conn), []).append(
+            (item_id, title, body, content_hash))
+        return False
     from . import embed as _embed
 
     if not _embed.semantic_enabled():
-        return
+        return False
     blob = _embed.embed_text(_embed.doc_text(title, body))
     if blob is None:
-        return
-    # No explicit commit: in autocommit mode (isolation_level=None) the bare
-    # execute persists immediately; if upsert was called inside an outer `with
-    # tx`, this UPDATE simply joins that transaction. Committing here would
-    # close the caller's transaction early and break SAVEPOINT nesting.
+        return False
     try:
-        conn.execute(
-            "UPDATE memory_items SET embedding = ? WHERE id = ?", (blob, item_id)
-        )
+        return conn.execute(
+            # CAS on the text: a newer write may have landed while the model ran
+            "UPDATE memory_items SET embedding = ? WHERE id = ? AND content_hash = ?",
+            (blob, item_id, content_hash),
+        ).rowcount > 0
     except sqlite3.Error as exc:
         log.warning("could not store embedding for id=%s: %s", item_id, exc)
+        return False
 
 
 def reindex_embeddings(
@@ -1850,66 +1725,30 @@ def reindex_embeddings(
     for row in rows:
         item = MemoryItem.from_row(row)
         body = load_body(item) if row["body_path"] else row["body"]
-        blob = _embed.embed_text(_embed.doc_text(row["title"], body))
-        if blob is None:
-            continue
-        conn.execute(
-            "UPDATE memory_items SET embedding = ? WHERE id = ?", (blob, row["id"])
-        )
-        updated += 1
-    # Autocommit connection — see sweep_lifecycle for why there is no commit().
+        updated += _set_embedding(conn, row["id"], row["title"], body, row["content_hash"])
     return {"updated": updated, "total": len(rows)}
 
 
-def soft_delete(conn: sqlite3.Connection, slug: str, reason: str) -> bool:
-    # No `allow_sealed` override: a caller that says "trust me, this is the
-    # owner" is exactly the shape that gave round 12 its P1. The mutation asks
-    # `owner_present()` itself; callers cannot vote around it.
-    row = conn.execute(
-        "SELECT * FROM memory_items WHERE slug = ?", (slug,)
-    ).fetchone()
-    if not row:
-        return False
-    now = _now()
+def soft_delete(conn: sqlite3.Connection, slug: str, reason: str, *,
+                surface: str = "library") -> bool:
+    """Tombstone a live record and write its history row; False if there is
+    none. Deleting a sealed record is the owner's call (INV-03), which the
+    mutation asks `_owner(surface)` itself: no caller vouches for the owner."""
     with tx(conn):
-        # re-read under the lock: the row may have changed since the SELECT above
-        fresh = conn.execute(
-            "SELECT title, body, owner_seal, deleted_at FROM memory_items "
-            "WHERE id = ?", (row["id"],)
-        ).fetchone() or row
-        if fresh["deleted_at"] is not None:
-            # already a tombstone: `rm` used to succeed again and again, each time
-            # appending another history row for one record
+        row = conn.execute(
+            "SELECT id, slug, title, body, body_path, content_hash, owner_seal "
+            "FROM memory_items WHERE slug = ? AND deleted_at IS NULL", (slug,)
+        ).fetchone()
+        if row is None:
             return False
-        if not owner_present() and fresh["owner_seal"]:
-            # Deleting a record the owner wrote or approved is the owner's call,
-            # exactly as archiving it is — and this is the harder of the two to
-            # notice afterwards.
+        if row["owner_seal"] and not _owner(surface):
             raise SealedRecord(
                 f"'{slug}' is the owner's record (written or approved by them); "
                 f"deleting it is the owner's call: skillmem rm {slug}"
             )
-        prev_hash = _last_chain_hash(conn)
-        now = _chain_clock(conn, now)
-        payload = {
-            "slug": row["slug"], "old_title": fresh["title"], "old_body": fresh["body"],
-            "changed_at": now, "changed_by": None, "reason": f"deleted: {reason}",
-        }
-        self_hash = _chain_hash(prev_hash, payload)
-        conn.execute(
-            "INSERT INTO memory_history (slug, old_title, old_body, changed_at, reason,"
-            " prev_hash, self_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (row["slug"], fresh["title"], fresh["body"], now,
-             f"deleted: {reason}", prev_hash, self_hash),
-        )
-        cur = conn.execute(
-            "UPDATE memory_items SET deleted_at = ? "
-            # already a tombstone: `rm` used to succeed three times over and
-            # write three history rows for one record
-            "WHERE id = ? AND deleted_at IS NULL", (now, row["id"]),
-        )
-        if cur.rowcount == 0:
-            return False
+        now = _now()
+        _append_history(conn, row, now, None, f"deleted: {reason}")
+        conn.execute("UPDATE memory_items SET deleted_at = ? WHERE id = ?", (now, row["id"]))
     return True
 
 
@@ -1947,12 +1786,7 @@ def verify_history(conn: sqlite3.Connection) -> tuple[int, list[ChainBreak]]:
     prev_actual = None  # the hash we'll require the next row's prev_hash to equal
     breaks: list[ChainBreak] = []
     for r in rows:
-        payload = {
-            "slug": r["slug"], "old_title": r["old_title"], "old_body": r["old_body"],
-            "changed_at": r["changed_at"], "changed_by": r["changed_by"],
-            "reason": r["reason"],
-        }
-        expected_self = _chain_hash(prev_actual, payload)
+        expected_self = _chain_hash(prev_actual, _chain_payload(r))
         if r["prev_hash"] != prev_actual or r["self_hash"] != expected_self:
             breaks.append(ChainBreak(
                 row_id=r["id"], slug=r["slug"], changed_at=r["changed_at"],
@@ -1997,14 +1831,6 @@ def _replace_links_inner(
         )
 
 
-def replace_links(
-    conn: sqlite3.Connection, from_slug: str, to_slugs: Iterable[str]
-) -> None:
-    """Public helper — wraps :func:`_replace_links_inner` in a transaction."""
-    with tx(conn):
-        _replace_links_inner(conn, from_slug, to_slugs)
-
-
 # --------------------------------------------------------------------------- #
 # read / search
 # --------------------------------------------------------------------------- #
@@ -2018,9 +1844,28 @@ def get(conn: sqlite3.Connection, slug: str) -> MemoryItem | None:
     return MemoryItem.from_row(row) if row else None
 
 
+def read_record(conn: sqlite3.Connection, slug: str, *,
+                with_history: bool = False) -> dict[str, Any] | None:
+    """The by-slug read behind `cat`, mem_get and /get: the row, its whole
+    body, its links and its history from one committed state (INV-04), so a
+    reader never pairs old text with the history of an edit it did not see.
+    ``links_in`` holds the live source rows, for a caller that filters them."""
+    with snapshot(conn):
+        item = get(conn, slug)
+        if item is None:
+            return None
+        body = served_body(item)
+        # the words of the text served, which the owner approved (INV-07)
+        return {"item": item, "body": body,
+                "links_out": sorted(extract_wikilinks(body)),
+                "links_in": [row for src in links_to(conn, slug)
+                             if (row := get(conn, src)) is not None],
+                "history": history(conn, slug) if with_history else []}
+
+
 def history(conn: sqlite3.Connection, slug: str) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT * FROM memory_history WHERE slug = ? ORDER BY changed_at DESC",
+        "SELECT * FROM memory_history WHERE slug = ? ORDER BY changed_at DESC, id DESC",
         (slug,),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -2042,6 +1887,57 @@ def links_to(conn: sqlite3.Connection, slug: str) -> list[str]:
     return [r["from_slug"] for r in rows]
 
 
+# the narrow columns _visibility_view reads, for a walk that reads no bodies
+_VIEW_COLUMNS = "id, slug, strength, visibility, topics, agent, trusted_at"
+
+
+def _visibility_view(row: Any) -> dict[str, Any]:
+    """What a ``visible`` predicate is shown of a row, the same on every read."""
+    return {"visibility": row["visibility"], "agent": row["agent"],
+            "trusted_at": row["trusted_at"], "slug": row["slug"],
+            "strength": row["strength"], "topics": _parse_json_list(row["topics"])}
+
+
+def _rank_filter(kind: str | None = None, project: str | None = None,
+                 exclude_kinds: tuple[str, ...] = (), prefix: str = "") -> tuple[str, list[Any]]:
+    """The SQL filter of a ranked read: the ranking and the refetch of its
+    winners (_fetch_live) state it once, so a row that stopped matching in
+    between is not returned (INV-04)."""
+    where = [f"{prefix}deleted_at IS NULL", f"{prefix}lifecycle != 'archived'"]
+    params: list[Any] = []
+    if kind:
+        where.append(f"{prefix}kind = ?")
+        params.append(kind)
+    if project:
+        where.append(f"{prefix}project = ?")
+        params.append(project)
+    if exclude_kinds:
+        where.append(f"{prefix}kind NOT IN ({','.join('?' * len(exclude_kinds))})")
+        params.extend(exclude_kinds)
+    return " AND ".join(where), params
+
+
+def _fetch_live(conn: sqlite3.Connection, ids: list[int],
+                visible: Callable[[dict[str, Any]], bool] | None = None,
+                **filters: Any) -> dict[int, Any]:
+    """Rows for ids a ranking picked, re-read with the ranking's own filter
+    (_rank_filter) and the caller's ``visible`` asked again of the row whose
+    text is returned (INV-04). Every ranked read fetches through here."""
+    if not ids:
+        return {}
+    clause, params = _rank_filter(**filters)
+    return {r["id"]: r for r in conn.execute(
+        f"SELECT * FROM memory_items WHERE id IN ({','.join('?' * len(ids))}) "
+        f"AND {clause}", [*ids, *params]).fetchall()
+        if visible is None or visible(_visibility_view(r))}
+
+
+def _kind_filter(kind: str | None) -> str | None:
+    """A kind filter as writes normalise kinds ("Reference" finds "reference");
+    raises ValueError for one nothing can match."""
+    return _valid_kind(kind) if kind else kind
+
+
 def list_items(
     conn: sqlite3.Connection,
     *,
@@ -2051,41 +1947,30 @@ def list_items(
     recent: bool = True,
     visible: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[MemoryItem]:
-    if kind:
-        try:
-            kind = _valid_kind(kind)  # "Reference" filters find "reference" rows
-        except ValueError:
-            return []                 # a filter nothing can match matches nothing
-    where = ["deleted_at IS NULL", "lifecycle != 'archived'"]
-    params: list[Any] = []
-    if kind:
-        where.append("kind = ?")
-        params.append(kind)
-    if project:
-        where.append("project = ?")
-        params.append(project)
+    try:
+        kind = _kind_filter(kind)
+    except ValueError:
+        return []
+    where, params = _rank_filter(kind, project)
     order = "updated_at DESC" if recent else "slug ASC"
     if visible is None:
-        sql = f"SELECT * FROM memory_items WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?"
+        sql = f"SELECT * FROM memory_items WHERE {where} ORDER BY {order} LIMIT ?"
         rows = conn.execute(sql, [*params, limit]).fetchall()
         return [MemoryItem.from_row(r) for r in rows]
     # a filtered listing walks the order on narrow columns and stops at the
     # first `limit` rows the caller may see; full rows are read only for those
     cur = conn.execute(
-        f"SELECT id, visibility, topics, agent FROM memory_items "
-        f"WHERE {' AND '.join(where)} ORDER BY {order}", params)
+        f"SELECT {_VIEW_COLUMNS} FROM memory_items WHERE {where} ORDER BY {order}", params)
     keep: list[int] = []
     for r in cur:
-        if visible({"visibility": r["visibility"], "agent": r["agent"],
-                    "topics": _parse_json_list(r["topics"])}):
+        if visible(_visibility_view(r)):
             keep.append(r["id"])
             if len(keep) >= limit:
                 cur.close()
                 break
     if not keep:
         return []
-    fetched = {r["id"]: r for r in conn.execute(
-        f"SELECT * FROM memory_items WHERE id IN ({','.join('?' * len(keep))})", keep).fetchall()}
+    fetched = _fetch_live(conn, keep, visible, kind=kind, project=project)
     return [MemoryItem.from_row(fetched[i]) for i in keep if i in fetched]
 
 
@@ -2098,45 +1983,31 @@ def _escape_fts(query: str) -> str:
     would be too strict for natural-language queries — a 5-word question
     almost never has all 5 stems in a single short message.
     """
-    # Split the way the FTS5 tokenizer splits the documents, not on whitespace.
-    # tool-recall passes a FILE PATH as the query, and on a BM25-only install
-    # (`pip install skillmem` without the semantic extra) "/work/analysis.ipynb"
-    # became one phrase token and matched nothing at all — recall was silently
-    # dead for every Edit/Write/NotebookEdit.
-    tokens = _WORD_RE.findall(query)  # same shape as the indexed tokens
-    if not tokens:
-        return '""'
-    parts: list[str] = []
-    seen: set[str] = set()
-    for raw in tokens:
-        stem = _stem_word(raw)
-        if len(stem) < 2 or stem in seen:
-            continue
-        seen.add(stem)
-        safe = stem.replace('"', '""')
-        parts.append(f'"{safe}"*')
-    return " OR ".join(parts) if parts else '""'
+    # tokenised as the documents are, not on whitespace: tool-recall's query
+    # is a file path
+    return _escape_fts_or(_WORD_RE.findall(query), unique=True)
 
 
-def _escape_fts_or(tokens: Iterable[str]) -> str:
-    """Stem-aware OR query (used by conflict detection)."""
+def _escape_fts_or(tokens: Iterable[str], *, unique: bool = False) -> str:
+    """Stem-aware OR query of prefix matches; ``'""'`` when nothing is left."""
     parts: list[str] = []
     for raw in tokens:
         stem = _stem_word(raw)
-        if len(stem) < 2:
-            continue
-        safe = stem.replace('"', '""')
-        parts.append(f'"{safe}"*')
+        part = '"' + stem.replace('"', '""') + '"*'
+        if len(stem) >= 2 and not (unique and part in parts):
+            parts.append(part)
     return " OR ".join(parts) if parts else '""'
 
 
 def _snippet_for(body: str, query: str, *, around: int = 90) -> str:
     """Render an excerpt around the first matched stem (cheap, language-aware)."""
+    notice = EXCERPT_NOTICE if body.startswith(EXCERPT_NOTICE) else ""
+    body = body[len(notice):]
     if not body:
-        return ""
+        return notice
     stems = [_stem_word(t) for t in query.split() if len(_stem_word(t)) >= 2]
     if not stems:
-        return body[: around * 2] + ("…" if len(body) > around * 2 else "")
+        return notice + body[: around * 2] + ("…" if len(body) > around * 2 else "")
     text = body
     lower = body.lower()
     idx = -1
@@ -2149,12 +2020,12 @@ def _snippet_for(body: str, query: str, *, around: int = 90) -> str:
         if idx >= 0:
             break
     if idx < 0:
-        return body[: around * 2] + ("…" if len(body) > around * 2 else "")
+        return notice + body[: around * 2] + ("…" if len(body) > around * 2 else "")
     start = max(0, idx - around)
     end = min(len(text), idx + around)
     pre = "…" if start > 0 else ""
     post = "…" if end < len(text) else ""
-    return pre + text[start:end].replace("\n", " ") + post
+    return notice + pre + text[start:end].replace("\n", " ") + post
 
 
 def _freshness(now: int, updated_at: int, freshness_until: int | None) -> tuple[str, int]:
@@ -2197,33 +2068,18 @@ def _bm25_ids(
 
     ``pool=None`` returns every match (a visibility-filtered caller ranks
     once and takes what it may see)."""
-    kind_clause = "AND m.kind = ?" if kind else ""
-    project_clause = "AND m.project = ?" if project else ""
     # Excluding kinds AFTER the candidate pool would drop the answer: the pool is
     # capped, so a wall of session recaps can fill it and hide every skill.
-    excl_clause = (
-        f"AND m.kind NOT IN ({','.join('?' * len(exclude_kinds))})"
-        if exclude_kinds else "")
+    clause, filters = _rank_filter(kind, project, exclude_kinds, "m.")
     sql = f"""
         SELECT m.id AS id, bm25(mem_fts_stem) AS r
         FROM mem_fts_stem
         JOIN memory_items m ON m.id = mem_fts_stem.rowid
-        WHERE mem_fts_stem MATCH ?
-          AND m.deleted_at IS NULL
-          AND m.lifecycle != 'archived'
-          {kind_clause}
-          {project_clause}
-          {excl_clause}
+        WHERE mem_fts_stem MATCH ? AND {clause}
         ORDER BY r
         LIMIT ?
     """
-    params: list[Any] = [_escape_fts(query)]
-    if kind:
-        params.append(kind)
-    if project:
-        params.append(project)
-    params.extend(exclude_kinds)
-    params.append(-1 if pool is None else pool)
+    params: list[Any] = [_escape_fts(query), *filters, -1 if pool is None else pool]
     return [row["id"] for row in conn.execute(sql, params).fetchall()]
 
 
@@ -2240,10 +2096,14 @@ def _vector_ids(
 
     At our scale (~10^3 rows) a full numpy matmul is sub-millisecond, so no
     vector index is needed. Returns [] when the embedder is unavailable, which
-    makes the caller degrade to pure BM25.
+    makes the caller degrade to pure BM25 — and inside a caller's transaction:
+    the query is embedded here, and the model never runs under the write lock
+    (INV-09; a search in a caller's tx locked out every other writer).
     """
     from . import embed as _embed
 
+    if conn.in_transaction:
+        return []
     qb = _embed.pack_query(query)
     if qb is None:
         return []
@@ -2251,27 +2111,17 @@ def _vector_ids(
         import numpy as np
     except Exception:
         return []
-    kind_clause = "AND kind = ?" if kind else ""
-    project_clause = "AND project = ?" if project else ""
-    excl_clause = (
-        f"AND kind NOT IN ({','.join('?' * len(exclude_kinds))})"
-        if exclude_kinds else "")
-    sql = (
-        "SELECT id, embedding FROM memory_items "
-        "WHERE embedding IS NOT NULL AND deleted_at IS NULL "
-        "AND lifecycle != 'archived' "
-        f"{kind_clause} {project_clause} {excl_clause}"
-    )
-    params: list[Any] = []
-    if kind:
-        params.append(kind)
-    if project:
-        params.append(project)
-    params.extend(exclude_kinds)
-    rows = conn.execute(sql, params).fetchall()
+    clause, params = _rank_filter(kind, project, exclude_kinds)
+    rows = conn.execute("SELECT id, embedding FROM memory_items "
+                        f"WHERE embedding IS NOT NULL AND {clause}", params).fetchall()
     if not rows:
         return []
     q = np.frombuffer(qb, dtype="float32")
+    # one blob of another width (a truncated write, a model swap) made np.stack
+    # raise, and every search failed while semantic recall was on
+    rows = [r for r in rows if len(r["embedding"]) == len(qb)]
+    if not rows:
+        return []
     ids = [r["id"] for r in rows]
     mat = np.stack([np.frombuffer(r["embedding"], dtype="float32") for r in rows])
     sims = mat @ q                       # both sides pre-normalized -> cosine
@@ -2285,24 +2135,20 @@ def _keep_visible(
     visible: Callable[[dict[str, Any]], bool] | None,
     limit: int,
 ) -> list[int]:
-    """The first ``limit`` of ``ids`` (rank order kept) that ``visible`` accepts.
-
-    One narrow query per 500 ids — visibility, topics and agent only — so a
-    caller who may see nothing costs one ranking pass and no body reads. The
-    HTTP layer used to widen its page 5→20→80→… re-ranking and re-fetching
-    full rows each time; with 9k hidden rows that was ~16k rows of bodies.
-    """
+    """The first ``limit`` of ``ids`` (rank order kept) that ``visible`` accepts,
+    asked within the ranking, before the limit: rows filtered after it could
+    fill the limit and keep an approved one out. One narrow query per 500 ids,
+    no body reads."""
     if visible is None:
         return ids[:limit]
     out: list[int] = []
     for start in range(0, len(ids), 500):
         chunk = ids[start:start + 500]
         rows = conn.execute(
-            f"SELECT id, visibility, topics, agent FROM memory_items "
+            f"SELECT {_VIEW_COLUMNS} FROM memory_items "
             f"WHERE id IN ({','.join('?' * len(chunk))})", chunk,
         ).fetchall()
-        meta = {r["id"]: {"visibility": r["visibility"], "agent": r["agent"],
-                          "topics": _parse_json_list(r["topics"])} for r in rows}
+        meta = {r["id"]: _visibility_view(r) for r in rows}
         for i in chunk:
             m = meta.get(i)
             if m is not None and visible(m):
@@ -2361,20 +2207,17 @@ def search(
     exclude_kinds: tuple[str, ...] = (),
     visible: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[dict[str, Any]]:
-    if kind:
-        try:
-            kind = _valid_kind(kind)  # "Reference" filters find "reference" rows
-        except ValueError:
-            return []                 # a filter nothing can match matches nothing
+    try:
+        kind = _kind_filter(kind)
+    except ValueError:
+        return []
     ids = hybrid_rank_ids(conn, query, kind=kind, project=project, limit=limit,
                           exclude_kinds=exclude_kinds, visible=visible)
     if not ids:
         return []
-    placeholders = ",".join("?" * len(ids))
-    rows = conn.execute(
-        f"SELECT * FROM memory_items WHERE id IN ({placeholders})", ids
-    ).fetchall()
-    by_id = {row["id"]: row for row in rows}
+    # callers classify trust by what this read returns
+    by_id = _fetch_live(conn, ids, visible, kind=kind, project=project,
+                        exclude_kinds=exclude_kinds)
     rows = [by_id[i] for i in ids if i in by_id]  # preserve fused order
 
     now = _now()
@@ -2384,12 +2227,18 @@ def search(
         # Raw float32 blob: garbage in CLI --format json and a serialization
         # 500 in the HTTP layer. Nothing downstream reads it from a hit.
         d.pop("embedding", None)
+        # the index copy of title and body: emitted beside the framed body it
+        # was the unapproved text again, outside the frame (INV-07)
+        d.pop("stemmed", None)
         d["tags"] = _parse_json_list(d.get("tags"))
         d["topics"] = _parse_json_list(d.get("topics"))
         d["attachments"] = _parse_json_list(d.get("attachments"))
         label, stale = _freshness(now, d["updated_at"], d.get("freshness_until"))
         d["freshness"] = label
         d["stale_days"] = stale
+        if row["body_path"]:
+            # the text, or the excerpt saying it is one, as recall and get serve (INV-15)
+            d["body"] = served_body(MemoryItem.from_row(row))
         d["snippet"] = _snippet_for(d.get("body", ""), query)
         # fused (RRF) position; the old BM25 column is gone in the hybrid path
         d["rank"] = pos
@@ -2417,35 +2266,24 @@ def find_conflicts(
 ) -> list[dict[str, Any]]:
     """Return existing memories whose word content overlaps the new one.
 
-    ``visible`` gets ``{"visibility", "topics", "agent"}`` of each candidate
-    and drops the ones the caller may not see: a 409 that names another
-    agent's private title is a read through the trust boundary.
-
-    Uses FTS5 BM25 to surface candidates (cheap), then computes asymmetric
-    inclusion overlap ``|A ∩ B| / min(|A|, |B|)`` on the bag of words: if 70%
-    of one doc's words are in the other, treat it as a duplicate — regardless
-    of length. No LLM involved.
+    FTS5 BM25 surfaces candidates, then the inclusion overlap
+    ``|A ∩ B| / min(|A|, |B|)`` of their word bags decides: 70% of one doc's
+    words in the other is a duplicate. ``visible`` drops candidates the caller
+    may not see, before the top ``candidates`` are taken: a 409 naming another
+    agent's private record is a read through the trust boundary.
     """
     bag = _word_bag(title + "\n" + body)
     if len(bag) < 5:
         return []  # too short to make a meaningful overlap claim
 
-    # Conflict detection needs OR semantics across the bag; use stem-OR query
-    # against mem_fts_stem (same index used by /search).
     fts_query = _escape_fts_or(list(bag)[:32])
     if fts_query == '""':
         return []
     try:
-        # The visibility filter runs in Python, so with a filter the SQL has no
-        # LIMIT: the cursor walks the BM25 order and stops once `candidates`
-        # VISIBLE rows are scored. A fixed window (5, then 100) let that many
-        # hidden rows crowd out the writer's own duplicate.
-        # Narrow on purpose: without a LIMIT SQLite sorts every match before
-        # the first row comes out, and dragging `body` through that sort cost
-        # 0.3-0.5 s per write on a 9k-row database. Bodies are fetched below
-        # for the few rows that get scored.
+        # With a filter the walk has no LIMIT and stops at `candidates` visible
+        # rows; narrow columns, as an unlimited walk sorts every match first.
         rows = conn.execute(
-            "SELECT m.id, m.slug, m.visibility, m.topics, m.agent "
+            "SELECT m.id, m.slug, m.strength, m.visibility, m.topics, m.agent, m.trusted_at "
             "FROM mem_fts_stem "
             "JOIN memory_items m ON m.id = mem_fts_stem.rowid "
             "WHERE mem_fts_stem MATCH ? AND m.deleted_at IS NULL "
@@ -2453,7 +2291,6 @@ def find_conflicts(
             (fts_query, candidates if visible is None else -1),
         )
     except sqlite3.OperationalError as exc:
-        # Log so a broken FTS index isn't silently treated as "no conflicts".
         log.warning("find_conflicts FTS query failed (%s); treating as empty", exc)
         return []
 
@@ -2462,34 +2299,24 @@ def find_conflicts(
     for row in rows:
         if exclude_slug and row["slug"] == exclude_slug:
             continue
-        if visible is not None and not visible({
-            "visibility": row["visibility"], "agent": row["agent"],
-            "topics": _parse_json_list(row["topics"]),
-        }):
+        if visible is not None and not visible(_visibility_view(row)):
             continue
         if scored >= candidates:          # the top-N *visible* by BM25, as before the filter
             rows.close()
             break
         scored += 1
         text = conn.execute(
-            "SELECT title, body FROM memory_items WHERE id = ?", (row["id"],)
+            "SELECT * FROM memory_items WHERE id = ? AND deleted_at IS NULL", (row["id"],)
         ).fetchone()
-        if text is None:                  # deleted between the walk and now
-            continue
+        if text is None or (visible is not None and not visible(_visibility_view(text))):
+            continue                      # deleted or hidden between the walk and now
         other = _word_bag(text["title"] + "\n" + text["body"])
         if not other:
             continue
-        inter = bag & other
-        denom = min(len(bag), len(other))
-        if not denom:
-            continue
-        overlap = len(inter) / denom
+        overlap = len(bag & other) / min(len(bag), len(other))
         if overlap >= threshold:
-            conflicts.append({
-                "slug": row["slug"],
-                "title": text["title"],
-                "overlap": round(overlap, 3),
-            })
+            # no title: an error message is never framed (INV-07)
+            conflicts.append({"slug": row["slug"], "overlap": round(overlap, 3)})
     return conflicts
 
 
@@ -2514,7 +2341,8 @@ def briefing(
     kind (user first, then feedback, then reference, ...). When the budget is
     hit we stop and report how many were omitted.
     """
-    kinds = kinds or ["user", "feedback"]
+    # as _valid_kind normalises: `inject --types Feedback` found nothing
+    kinds = [_re.sub(r"\s+", " ", k.strip().lower()) for k in kinds or ["user", "feedback"]]
     char_budget = budget_tokens * _CHARS_PER_TOKEN
     sections: list[dict[str, Any]] = []
     used = 0
@@ -2526,9 +2354,7 @@ def briefing(
     ]
 
     for kind in ordered:
-        # Titles only, and only what the owner approved: the briefing has no room
-        # for a frame, and a title is text from the same source as its body —
-        # an unapproved one would arrive looking like a rule the owner set.
+        # approved titles only: the briefing has no room for a frame (INV-07)
         rows = conn.execute(
             """
             SELECT slug, title, updated_at FROM memory_items
@@ -2540,7 +2366,7 @@ def briefing(
         ).fetchall()
         unapproved += conn.execute(
             "SELECT COUNT(*) FROM memory_items WHERE kind = ? AND deleted_at IS NULL "
-            "AND trusted_at IS NULL", (kind,),
+            "AND lifecycle != 'archived' AND trusted_at IS NULL", (kind,),
         ).fetchone()[0]
         if not rows:
             continue
@@ -2558,10 +2384,8 @@ def briefing(
         if entries:
             sections.append({"kind": kind, "items": entries})
 
-    # A record the owner wrote or approved that an agent has since rewritten loses
-    # its approval — deliberately, the approval belonged to those words — and so
-    # it leaves this briefing. Said out loud, by slug: otherwise a rule the owner
-    # has relied on for months just stops arriving, and nothing says why.
+    # the owner's records an agent rewrote since, which lost their approval
+    # and so left the briefing: named, or a rule just stops arriving
     revoked = [r["slug"] for r in conn.execute(
         "SELECT slug FROM memory_items WHERE owner_seal = 1 AND trusted_at IS NULL "
         "AND deleted_at IS NULL AND lifecycle != 'archived' "
@@ -2662,6 +2486,8 @@ def reinforce(
     slug: str,
     *,
     evidence: str = "self_report",
+    visible: Callable[[dict[str, Any]], bool] | None = None,
+    surface: str = "library",
 ) -> dict[str, Any] | None:
     """Record that a skill was used, and move its strength by the evidence.
 
@@ -2670,6 +2496,9 @@ def reinforce(
     but leaves strength alone. ``test_passed`` / ``diff_accepted`` /
     ``user_confirmed`` are outside signals and raise it. ``failure`` says the
     task went wrong after the skill was applied and lowers it.
+
+    Only a live, visible skill is reinforced, and ``visible`` (the HTTP
+    caller's predicate) is asked of the row read under the write lock.
     """
     if evidence not in EVIDENCE_WEIGHTS:
         raise ValueError(
@@ -2677,90 +2506,89 @@ def reinforce(
             f"{', '.join(sorted(EVIDENCE_WEIGHTS))}"
         )
     now = _now()
-    with tx(conn):     # read and write as one step: the kind, the lifecycle and
-        # the deletion state all have to still hold when the UPDATE lands
-        # skills only: strength and decay are a skill's mechanics, and every
-        # channel's description promises a non-skill is refused
+    with tx(conn):
         row = conn.execute(
-            "SELECT id, strength, access_count, confirmed_count, failure_count "
-            "FROM memory_items WHERE slug = ? AND deleted_at IS NULL "
-            # an archived record is out of every read; handing it strength and
-            # recency contradicts what set_pinned and set_archived both say
+            f"SELECT {_VIEW_COLUMNS} FROM memory_items WHERE slug = ? AND deleted_at IS NULL "
             "AND kind = 'skill' AND lifecycle != 'archived'",
             (slug,),
         ).fetchone()
-        if not row:
+        if not row or (visible is not None and not visible(_visibility_view(row))):
             return None
-        return _reinforce_row(conn, slug, row, evidence=evidence, now=now)
+        # relative arithmetic, so concurrent confirmations add up
+        if evidence == "failure":
+            # an agent's report does not walk the owner's rule below
+            # tool-recall's floor (INV-03); the floor never lifts a strength
+            conn.execute(
+                "UPDATE memory_items SET strength = CASE WHEN owner_seal = 1 AND ? "
+                "THEN strength ELSE MIN(strength, MAX(?, strength * ?)) END, "
+                "access_count = access_count + 1, last_accessed_at = ?, "
+                "failure_count = failure_count + 1 WHERE id = ?",
+                (not _owner(surface), DECAY_FLOOR, FAILURE_FACTOR, now, row["id"]),
+            )
+        else:
+            boost = EVIDENCE_WEIGHTS[evidence]
+            conn.execute(
+                "UPDATE memory_items SET strength = MIN(?, strength + ?), "
+                "access_count = access_count + 1, last_accessed_at = ?, "
+                "confirmed_count = confirmed_count + ? WHERE id = ?",
+                (STRENGTH_CAP, boost, now, 1 if boost > 0 else 0, row["id"]),
+            )
+        fresh = conn.execute(
+            "SELECT strength, access_count, confirmed_count, failure_count "
+            "FROM memory_items WHERE id = ?", (row["id"],),
+        ).fetchone()
+    return {"slug": slug, "strength": round(fresh["strength"], 3),
+            "access_count": fresh["access_count"], "evidence": evidence,
+            "confirmed_count": fresh["confirmed_count"],
+            "failure_count": fresh["failure_count"]}
 
 
-def _reinforce_row(
-    conn: sqlite3.Connection, slug: str, row: Any, *, evidence: str, now: int
-) -> dict[str, Any]:
-    # One statement, relative arithmetic: two confirmations landing together
-    # used to read the same counters and one overwrote the other.
-    if evidence == "failure":
-        conn.execute(
-            "UPDATE memory_items SET strength = MAX(?, strength * ?), "
-            "access_count = access_count + 1, last_accessed_at = ?, "
-            "failure_count = failure_count + 1 "
-            "WHERE id = ? AND deleted_at IS NULL",
-            (DECAY_FLOOR, FAILURE_FACTOR, now, row["id"]),
-        )
-    else:
-        boost = EVIDENCE_WEIGHTS[evidence]
-        conn.execute(
-            "UPDATE memory_items SET strength = MIN(?, strength + ?), "
-            "access_count = access_count + 1, last_accessed_at = ?, "
-            "confirmed_count = confirmed_count + ? "
-            "WHERE id = ? AND deleted_at IS NULL",
-            (STRENGTH_CAP, boost, now, 1 if boost > 0 else 0, row["id"]),
-        )
-    fresh = conn.execute(
-        "SELECT strength, access_count, confirmed_count, failure_count "
-        "FROM memory_items WHERE id = ? AND deleted_at IS NULL", (row["id"],),
-    ).fetchone()
-    if fresh is None:
-        return None      # deleted between the read and the write: nothing happened
-    new_strength, new_count = fresh["strength"], fresh["access_count"]
-    confirmed, failures = fresh["confirmed_count"], fresh["failure_count"]
-    return {"slug": slug, "strength": round(new_strength, 3),
-            "access_count": new_count, "evidence": evidence,
-            "confirmed_count": confirmed, "failure_count": failures}
+def reinforce_retrieved(
+    conn: sqlite3.Connection, slugs: Iterable[str], *,
+    visible: Callable[[dict[str, Any]], bool] | None = None, surface: str = "library",
+) -> dict[str, dict[str, Any]]:
+    """``reinforce`` each retrieved slug, as a read's bookkeeping: it never
+    fails the read or holds it up. Each waits 150 ms for the write lock at
+    most, and the first that cannot get it ends the pass. Returns the results
+    by slug."""
+    done: dict[str, dict[str, Any]] = {}
+    for slug in slugs:
+        prev = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        conn.execute("PRAGMA busy_timeout = 150")
+        try:
+            r = reinforce(conn, slug, visible=visible, surface=surface)
+        except sqlite3.OperationalError:
+            break
+        finally:
+            conn.execute(f"PRAGMA busy_timeout = {int(prev)}")
+        if r:
+            done[slug] = r
+    return done
 
 
 def set_pinned(
-    conn: sqlite3.Connection, slug: str, pinned: bool
+    conn: sqlite3.Connection, slug: str, pinned: bool, *, surface: str = "library"
 ) -> dict[str, Any] | None:
-    """Pin or unpin a skill. A pinned skill never decays and is never archived.
-
-    For the rule that matters *because* it is rarely needed — "deploy only
-    through the gate", "never force-push to main" — rarity is the whole point,
-    and decay would read it as irrelevance.
-    """
-    with tx(conn):     # read and write as one step, like every other mutation
+    """Pin or unpin a record. A pinned record never decays and is never
+    archived: for a rule that matters because it is rarely needed. The flag
+    only: neither updated_at (pinning is not an edit) nor the lifecycle (an
+    archived row comes back through set_archived alone)."""
+    with tx(conn):
         row = conn.execute(
-            "SELECT id, pinned, lifecycle FROM memory_items "
+            "SELECT id, pinned, lifecycle, owner_seal FROM memory_items "
             "WHERE slug = ? AND deleted_at IS NULL",
             (slug,),
         ).fetchone()
         if not row:
             return None
-        # the flag only — updated_at is the text's age, and pinning is not an
-        # edit, and lifecycle is not pinning's business: an archived row comes
-        # back through the one call that says so (set_archived / an archive call), so
-        # that strength is never handed out by a side effect of a different verb.
-        conn.execute(
-            "UPDATE memory_items SET pinned = ? WHERE id = ? AND deleted_at IS NULL",
-            (1 if pinned else 0, row["id"]),
-        )
-        # after the write: the caller prints this, and a pre-write value made
-        # `skillmem pin` describe a state that no longer held
-        after = conn.execute(
-            "SELECT lifecycle FROM memory_items WHERE id = ?", (row["id"],)
-        ).fetchone()
+        if row["owner_seal"] and bool(row["pinned"]) != pinned and not _owner(surface):
+            # an agent unpinning the owner's rule hands it to decay (INV-03)
+            raise SealedRecord(f"'{slug}' is the owner's record; only the owner "
+                               f"pins or unpins it: skillmem pin {slug}")
+        conn.execute("UPDATE memory_items SET pinned = ? WHERE id = ?",
+                     (1 if pinned else 0, row["id"]))
     return {"slug": slug, "pinned": pinned, "changed": bool(row["pinned"]) != pinned,
-            "lifecycle": after["lifecycle"] if after else row["lifecycle"]}
+            "lifecycle": row["lifecycle"]}
 
 
 def decay_stale(
@@ -2769,41 +2597,34 @@ def decay_stale(
     days_threshold: int = 14,
     kind: str = "skill",
 ) -> list[dict[str, Any]]:
-    """Ebbinghaus decay: reduce strength of skills not accessed recently."""
+    """Ebbinghaus decay: reduce strength of skills not accessed recently.
+
+    One step per elapsed threshold, idleness measured from the last access or
+    else the birth, and never a pinned or sealed record (INV-03). Read and
+    written under one lock: a pin or approval in between is honoured."""
     now = _now()
     days_threshold = max(1, int(days_threshold))   # 0 or negative compounded on every run
     cutoff = now - days_threshold * 86400
-    with tx(conn):    # a pin or an approval landing between the SELECT and the
-        # UPDATE used to be ignored, and the record decayed anyway
-        return _decay_stale_rows(conn, kind=kind, cutoff=cutoff, now=now)
-
-
-def _decay_stale_rows(
-    conn: sqlite3.Connection, *, kind: str, cutoff: int, now: int
-) -> list[dict[str, Any]]:
-    # A skill nobody has recalled yet is measured from its birth, not from
-    # "never" — otherwise the first nightly run hits a day-old skill. And one
-    # decay step per elapsed threshold: running the job twice in a night, or
-    # by hand after it, used to compound 0.85 each time.
-    rows = conn.execute(
-        "SELECT id, slug, strength FROM memory_items "
-        "WHERE kind = ? AND deleted_at IS NULL AND strength > ? AND pinned = 0 "
-        "AND COALESCE(last_accessed_at, created_at) <= ? "
-        "AND COALESCE(last_decayed_at, 0) <= ?",
-        (kind, DECAY_FLOOR, cutoff, cutoff),
-    ).fetchall()
     decayed: list[dict[str, Any]] = []
-    for r in rows:
-        new_strength = max(DECAY_FLOOR, r["strength"] * DECAY_FACTOR)
-        conn.execute(
-            "UPDATE memory_items SET strength = ?, last_decayed_at = ? WHERE id = ?",
-            (new_strength, now, r["id"]),
-        )
-        decayed.append({
-            "slug": r["slug"],
-            "old_strength": round(r["strength"], 3),
-            "new_strength": round(new_strength, 3),
-        })
+    with tx(conn):
+        for r in conn.execute(
+            "SELECT id, slug, strength FROM memory_items "
+            "WHERE kind = ? AND deleted_at IS NULL AND strength > ? "
+            "AND pinned = 0 AND owner_seal = 0 "
+            "AND COALESCE(last_accessed_at, created_at) <= ? "
+            "AND COALESCE(last_decayed_at, 0) <= ?",
+            (kind, DECAY_FLOOR, cutoff, cutoff),
+        ).fetchall():
+            new_strength = max(DECAY_FLOOR, r["strength"] * DECAY_FACTOR)
+            conn.execute(
+                "UPDATE memory_items SET strength = ?, last_decayed_at = ? WHERE id = ?",
+                (new_strength, now, r["id"]),
+            )
+            decayed.append({
+                "slug": r["slug"],
+                "old_strength": round(r["strength"], 3),
+                "new_strength": round(new_strength, 3),
+            })
     return decayed
 
 
@@ -2835,26 +2656,19 @@ def sweep_lifecycle(
     - stale:    untouched > STALE_AFTER_DAYS, currently 'active'
     - archived: untouched > ARCHIVE_AFTER_DAYS AND strength at the decay floor
                 (fully faded) — backed up first, never deleted.
-    Pinned skills sit out both transitions: they stay active however long they
-    go unused, which is the point of pinning them.
-    Archived skills are excluded from recall (see _bm25_ids/_vector_ids).
+    Pinned and sealed records sit out both (INV-03). Each transition writes
+    its history row (INV-13), under one lock with the chain head it extends.
     """
     now = _now()
-    # BEGIN IMMEDIATE: this appends history rows, and reading the chain head and
-    # inserting the next row must be one step — the same reason set_archived
-    # holds a transaction. Two sweeps, or a sweep and an agent archiving, used to
-    # append successors to the same predecessor and break the chain.
     with tx(conn):
         stale_cut = now - STALE_AFTER_DAYS * 86400
         archive_cut = now - ARCHIVE_AFTER_DAYS * 86400
 
         # COALESCE: a never-recalled skill counts idle time from its creation.
         archive_rows = conn.execute(
-            "SELECT id, slug, title, body, strength, last_accessed_at FROM memory_items "
+            "SELECT id, slug, title, body, body_path, content_hash, strength, last_accessed_at "
+            "FROM memory_items "
             "WHERE kind = ? AND deleted_at IS NULL AND lifecycle != 'archived' "
-            # owner_seal, like pinned: the nightly job is the slow path to the same
-            # place an archive is refused, and mem_reinforce evidence='failure'
-            # lets an agent walk a record's strength down to the floor on purpose.
             "AND pinned = 0 AND owner_seal = 0 "
             "AND strength <= ? AND COALESCE(last_accessed_at, created_at) < ?",
             (kind, DECAY_FLOOR, archive_cut),
@@ -2862,38 +2676,31 @@ def sweep_lifecycle(
         _backup_skills(archive_rows, "archive")
         archived = [r["slug"] for r in archive_rows]
         for r in archive_rows:
-            # the same audit row an explicit archive leaves: "gone from every read"
-            # must be answerable afterwards however it happened
-            _append_lifecycle_history(conn, r["slug"], r, "archived by nightly sweep", "sweep")
+            _append_history(conn, r, now, "sweep", "archived by nightly sweep")
             conn.execute(
                 "UPDATE memory_items SET lifecycle = 'archived' WHERE id = ?", (r["id"],)
             )
 
         stale_rows = conn.execute(
-            "SELECT id, slug FROM memory_items "
+            "SELECT id, slug, title, body, body_path, content_hash FROM memory_items "
             "WHERE kind = ? AND deleted_at IS NULL AND lifecycle = 'active' "
-            # 'stale' still shows up in every read, so it needs no seal exemption
-            "AND pinned = 0 "
+            "AND pinned = 0 AND owner_seal = 0 "
             "AND COALESCE(last_accessed_at, created_at) < ?",
             (kind, stale_cut),
         ).fetchall()
         staled = [r["slug"] for r in stale_rows]
         for r in stale_rows:
+            _append_history(conn, r, now, "sweep", "stale by nightly sweep")
             conn.execute(
                 "UPDATE memory_items SET lifecycle = 'stale' WHERE id = ?", (r["id"],)
             )
-    # No commit: the connection is autocommit (isolation_level=None), so the
-    # UPDATEs above are already durable. An explicit commit() here would close
-    # a caller's open `with tx()` block early and break SAVEPOINT nesting.
     return {"staled": staled, "archived": archived}
 
 
 def lifecycle_counts(
     conn: sqlite3.Connection, *, kind: str | None = None
 ) -> dict[str, int]:
-    """Count records per lifecycle state. kind=None counts every kind: an agent
-    can archive a note or a feedback rule too, and a skills-only count made
-    those invisible to the one command that reports the lifecycle."""
+    """Count records per lifecycle state; kind=None counts every kind."""
     rows = conn.execute(
         "SELECT lifecycle, COUNT(*) c FROM memory_items "
         "WHERE (? IS NULL OR kind = ?) AND deleted_at IS NULL GROUP BY lifecycle",
@@ -2902,90 +2709,60 @@ def lifecycle_counts(
     return {r["lifecycle"]: r["c"] for r in rows}
 
 
-def _append_lifecycle_history(
-    conn: sqlite3.Connection, slug: str, row: Any, reason: str, by: str | None
-) -> None:
-    """One tamper-evident row per lifecycle change — the owner's only trace of it."""
-    now = _chain_clock(conn, _now())
-    prev_hash = _last_chain_hash(conn)
-    payload = {
-        "slug": slug, "old_title": row["title"], "old_body": row["body"],
-        "changed_at": now, "changed_by": by, "reason": reason,
-    }
-    conn.execute(
-        "INSERT INTO memory_history (slug, old_title, old_body, changed_at, changed_by,"
-        " reason, prev_hash, self_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (slug, row["title"], row["body"], now, by, reason,
-         prev_hash, _chain_hash(prev_hash, payload)),
-    )
-
-
 def set_archived(
     conn: sqlite3.Connection, slug: str, archived: bool = True, *,
-    by: str | None = None
+    by: str | None = None, surface: str = "library"
 ) -> dict[str, Any] | None:
     """Archive a record (out of search, recall and inject; kept, reversible)
     or bring it back. A pinned record is refused — pin means "never archive".
 
-    Deletion stays with the owner at the CLI; an agent gets to say "this no
-    longer applies" without erasing anything. The seal check lives here, inside
-    the write transaction, and reads `owner_present()` directly: a caller
-    supplying its own "I am the owner" flag was the shape round 12 broke on.
+    Moving a sealed record either way is the owner's call (INV-03), asked of
+    `_owner(surface)` under the write lock. Only a real transition writes a
+    history row (INV-13) or, on a restore, refreshes recency and floors
+    strength so the next sweep does not archive it again. The lifecycle only:
+    updated_at is the text's age.
     """
-    with tx(conn):    # BEGIN IMMEDIATE: the seal check, the history row and the
-        # lifecycle write are one step, and two processes cannot append history
-        # rows to the same predecessor hash
+    with tx(conn):
         row = conn.execute(
-            "SELECT id, pinned, lifecycle, title, body, owner_seal FROM memory_items "
+            "SELECT id, slug, pinned, lifecycle, title, body, body_path, content_hash, "
+            "owner_seal FROM memory_items "
             "WHERE slug = ? AND deleted_at IS NULL",
             (slug,),
         ).fetchone()
         if not row:
             return None
-        if archived and not owner_present() and row["owner_seal"]:
-            raise SealedRecord(
-                f"'{slug}' is the owner's record (written or approved by them); "
-                f"an agent cannot archive it. The owner can: skillmem skills-archive {slug}"
-            )
-        if archived and row["pinned"]:
-            raise ValueError(f"'{slug}' is pinned; unpin it before archiving it")
-        # Hiding a record from every read is a change the owner must be able to
-        # see afterwards: mem_update leaves a history row, and so does this. The
-        # text is untouched, so the row records what was hidden, not a version.
         moving = ((row["lifecycle"] != "archived") if archived
                   else (row["lifecycle"] != "active"))
+        if moving and not _owner(surface) and row["owner_seal"]:
+            raise SealedRecord(
+                f"'{slug}' is the owner's record (written or approved by them); "
+                f"an agent cannot {'archive' if archived else 'restore'} it. "
+                f"The owner can: skillmem skills-archive {slug}"
+                + ("" if archived else " --restore")
+            )
+        if archived and moving and row["pinned"]:   # archiving an archived row is a no-op
+            raise ValueError(f"'{slug}' is pinned; unpin it before archiving it")
         if moving:
-            # only a real transition gets a row: "restored from active" recorded
-            # a change that never happened, and an agent could repeat it at will
-            _append_lifecycle_history(
-                conn, slug, row,
+            _append_history(
+                conn, row, _now(), by,
                 "archived" if archived else f"restored from {row['lifecycle']}",
-                by,
             )
-        if archived:
-            # lifecycle only — updated_at is the text's age, and archiving is
-            # not an edit; touching it would reorder listings and reset freshness
-            conn.execute(
-                "UPDATE memory_items SET lifecycle = 'archived' WHERE id = ?", (row["id"],)
-            )
-        elif row["lifecycle"] != "active":
-            # only a real restore refreshes recency and floors strength, or the
-            # nightly sweep_lifecycle would archive it again on its next run;
-            # calling this on an active row must not hand out strength for free
-            conn.execute(
-                "UPDATE memory_items SET lifecycle = 'active', "
-                "strength = MAX(strength, ?), last_accessed_at = ? "
-                "WHERE id = ? AND deleted_at IS NULL",
-                (0.5, _now(), row["id"]),
-            )
+            if archived:
+                conn.execute(
+                    "UPDATE memory_items SET lifecycle = 'archived' WHERE id = ?", (row["id"],)
+                )
+            else:
+                conn.execute(
+                    "UPDATE memory_items SET lifecycle = 'active', "
+                    "strength = MAX(strength, ?), last_accessed_at = ? WHERE id = ?",
+                    (0.5, _now(), row["id"]),
+                )
         return {"slug": slug, "lifecycle": "archived" if archived else "active",
                 "was": row["lifecycle"]}
 
 
 def restore_skill(conn: sqlite3.Connection, slug: str, *, by: str | None = None) -> bool:
-    """Bring a hidden skill back to 'active'. One implementation, shared with
-    set_archived(archived=False): the two used to hold the same UPDATE, and only
-    one of them learned not to hand strength to a row that was never hidden."""
+    """Bring a hidden skill back to 'active': ``set_archived(archived=False)``."""
     return set_archived(conn, slug, False, by=by) is not None
 
 
@@ -3014,6 +2791,8 @@ def find_duplicate_skills(
         "WHERE kind = 'skill' AND deleted_at IS NULL AND lifecycle != 'archived' "
         "AND embedding IS NOT NULL"
     ).fetchall()
+    from .embed import DIM
+    rows = [r for r in rows if len(r["embedding"]) == DIM * 4]   # see _vector_ids
     if len(rows) < 2:
         return []
     mat = np.stack([np.frombuffer(r["embedding"], dtype="float32") for r in rows])
@@ -3069,17 +2848,10 @@ def recall_skills(
     ranked_ids = _keep_visible(conn, sorted(
         fused, key=lambda i: -fused[i] * (1.0 + strength_by_id.get(i, 0.0) * SKILL_STRENGTH_COEF)
     ), visible, limit)
-    placeholders = ",".join("?" * len(ranked_ids))
-    fetched = {
-        row["id"]: row
-        for row in conn.execute(
-            f"SELECT * FROM memory_items WHERE id IN ({placeholders})", ranked_ids
-        ).fetchall()
-    }
+    fetched = _fetch_live(conn, ranked_ids, visible, kind="skill")
     rows = [fetched[i] for i in ranked_ids if i in fetched]
     now = _now()
     results: list[dict[str, Any]] = []
-    locked_out = False       # a writer holds the lock: stop trying to record recency
     for row in rows:
         d = {
             "slug": row["slug"],
@@ -3089,44 +2861,22 @@ def recall_skills(
             "access_count": row["access_count"],
             "score": round(fused[row["id"]], 5),
             "freshness": _freshness(now, row["updated_at"], row["freshness_until"])[0],
-            # Access-control fields. Callers that serve more than one principal
-            # (the HTTP layer) filter on these; omitting them made every skill
-            # look public to server._visible_to and leaked private bodies.
+            # what a caller serving several principals filters on, and approval
             "visibility": row["visibility"],
             "agent": row["agent"],
             "topics": _parse_json_list(row["topics"]),
-            # Provenance and approval. Omitting them made every skill — including
-            # the ones the owner had approved — read as unapproved downstream,
-            # which is how a trust marker stops meaning anything.
-            "origin": (row["origin"] if "origin" in row.keys() else "unknown"),
-            "trusted_at": (row["trusted_at"] if "trusted_at" in row.keys() else None),
+            "origin": row["origin"],
+            "trusted_at": row["trusted_at"],
             "kind": row["kind"],
             "tags": _parse_json_list(row["tags"]),
         }
         if row["body_path"]:
-            item = MemoryItem.from_row(row)
-            d["body"] = load_body(item)
-        if auto_reinforce:
-            # Recall is a read path that happens to record recency, and the hooks
-            # call it on every prompt. Its bookkeeping must never be the reason a
-            # recall fails or waits: reinforce takes a write lock, so a writer
-            # holding one turns this into "database is locked".
-            try:
-                if locked_out:
-                    r = None
-                else:
-                    prev_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-                    conn.execute("PRAGMA busy_timeout = 150")
-                    try:
-                        r = reinforce(conn, row["slug"])
-                    finally:
-                        conn.execute(f"PRAGMA busy_timeout = {int(prev_timeout)}")
-            except sqlite3.OperationalError:
-                # One busy_timeout per recall, not one per row: five rows behind a
-                # writer turned a 5 ms read into seconds of waiting in a hook.
-                r, locked_out = None, True
-            if r:
-                d["strength"] = r["strength"]
-                d["access_count"] = r["access_count"]
+            d["body"] = served_body(MemoryItem.from_row(row))
         results.append(d)
+    if auto_reinforce:
+        bumped = reinforce_retrieved(conn, [d["slug"] for d in results], visible=visible)
+        for d in results:
+            if d["slug"] in bumped:
+                d.update(strength=bumped[d["slug"]]["strength"],
+                         access_count=bumped[d["slug"]]["access_count"])
     return results

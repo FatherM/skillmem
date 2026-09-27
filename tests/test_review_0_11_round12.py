@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from skillmem import storage as S
+from tests import owner_trusts
 
 
 @pytest.fixture
@@ -58,8 +59,8 @@ def test_soft_delete_rejects_a_caller_supplied_seal_override(home, monkeypatch):
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="sealed-del", kind="feedback", title="rule",
                                 body="the owner's rule, sealed and about to be deleted",
-                                origin="owner"), owner_call=True)
-    S.set_trust(conn, "sealed-del", trusted=True)
+                                origin="owner"))
+    owner_trusts(conn, "sealed-del", trusted=True)
     assert conn.execute("SELECT owner_seal FROM memory_items WHERE slug='sealed-del'"
                         ).fetchone()["owner_seal"] == 1
     monkeypatch.setattr(S, "owner_present", lambda: False)
@@ -76,8 +77,8 @@ def test_set_archived_rejects_a_caller_supplied_seal_override(home, monkeypatch)
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="sealed-arch", kind="feedback", title="rule",
                                 body="the owner's rule, sealed and about to be archived",
-                                origin="owner"), owner_call=True)
-    S.set_trust(conn, "sealed-arch", trusted=True)
+                                origin="owner"))
+    owner_trusts(conn, "sealed-arch", trusted=True)
     assert conn.execute("SELECT owner_seal FROM memory_items WHERE slug='sealed-arch'"
                         ).fetchone()["owner_seal"] == 1
     monkeypatch.setattr(S, "owner_present", lambda: False)
@@ -144,13 +145,13 @@ def test_cli_import_vault_refuses_without_a_terminal(home, monkeypatch, tmp_path
 def test_storage_refuses_to_revive_a_sealed_tombstone_without_owner_call(home, monkeypatch):
     """The mutation layer's own guard, so a caller that avoids the CLI does
     not slip past. `_run_import` used to call
-    `upsert(..., revive=True, owner_call=S.owner_present())` and let a
+    `upsert(..., revive=True)` and let a
     forged dump resurrect an owner-deleted sealed rule with agent text."""
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="revive-me", kind="feedback", title="Original",
                                 body="the owner-approved body of this rule",
-                                origin="owner"), owner_call=True)
-    S.set_trust(conn, "revive-me", trusted=True)
+                                origin="owner"))
+    owner_trusts(conn, "revive-me", trusted=True)
     # the owner deletes it (with a terminal, using the mutation guard)
     monkeypatch.setattr(S, "owner_present", lambda: True)
     assert S.soft_delete(conn, "revive-me", "owner deleted") is True
@@ -161,7 +162,7 @@ def test_storage_refuses_to_revive_a_sealed_tombstone_without_owner_call(home, m
                                     title="forged replacement",
                                     body="text supplied by unattended importer",
                                     origin="agent"),
-                 revive=True, force=True, owner_call=False, reason="vault import")
+                 revive=True, force=True, reason="vault import")
     row = conn.execute("SELECT title, body, deleted_at FROM memory_items "
                        "WHERE slug='revive-me'").fetchone()
     # the record stays a tombstone with the owner's text preserved in history

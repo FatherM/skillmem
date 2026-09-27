@@ -1,5 +1,344 @@
 # Changelog
 
+## 0.12.0
+
+A correctness release. Several things that used to succeed quietly are now
+refused or reported, so read "Before you upgrade" first.
+
+### Before you upgrade
+
+- **Owner-only commands need you at a terminal.** `trust` and `--untrust`,
+  `rm`, `skills-archive` (both ways), `skills-restore`, `skills rm`,
+  `import-vault` and `uninstall --purge-db` refuse without a TTY. MCP, HTTP
+  and pack imports never count as the owner, even in your terminal.
+- **Sealed records (written or approved by you) are yours.** An agent cannot
+  change their text or metadata, pin or unpin them, restore them from the
+  archive or revive them after you deleted them; the refusal says to write a
+  proposal under a new slug. Failure reports, the nightly sweep and `decay`
+  no longer weaken or stale a sealed rule.
+- **Re-run `skillmem init --claude-code`** for the new deny rules
+  (`skills-restore`, `--purge-db`, `--db`, and `$`, backticks or `eval` next
+  to `skillmem`). They match substrings, so they also refuse your own
+  commands through Claude Code that mention them in a `skillmem` directory.
+- **Approval covers the kind as well as the text.** A write that changes only
+  the kind drops approval unless you make it at a terminal.
+- **Writing over an archived record is refused** ("restore it first")
+  instead of succeeding invisibly; a pack update over one is reported skipped.
+- **Imports change only the fields their file states.** `migrate`,
+  `import-vault` and `skills add` no longer clear fields a file does not
+  mention. `--kind`, the `note` fallback and a subfolder's project apply to
+  new records only, and neither default decides an existing record's origin
+  any more: a re-imported session note stays `derived` instead of becoming
+  your sealed `owner` record, and a feedback rule is no longer relabelled
+  `derived`. Case and whitespace variants such as `Note` also stay
+  `derived` in both importers, instead of becoming `agent` or a sealed
+  `owner` note (INV-14). `import-vault` restores a file as a whole skillmem dump
+  only when it carries `exported_at` as well as `metadata.node_type: memory`.
+  A Claude Code auto-memory has only the marker, so it is imported as a note.
+  It used to reset the fields it does not state (visibility, tags, topics,
+  project, TTL, strength) and raise an agent's record to `origin: owner`.
+  Skipping auto-memories (the library's `import_vault` default and
+  `--skip-frontmatter-memories`) no longer skips every dump too, which
+  restored nothing and exited 0 (INV-06).
+- **Imports refuse values they used to coerce, and exit 1 if any file
+  failed** (`migrate`, `import-vault`, `skills add`,
+  `init --migrate-existing`): `ttl_days: tomorrow` or `7.0`, `strength: null`,
+  `visibility: ""`, `project: yes`, a mapping as `tags`, a null inside a list
+  (`tags: [ops, null]`, which the library refuses), frontmatter or a
+  `metadata` key that is not a mapping (`metadata: feedback` became a note,
+  never a rule). The other files are still imported.
+- **`migrate` reads links the way `import-vault` does:** a link leading out
+  of its directory, nowhere, or to a directory is reported (exit 1) instead
+  of read or passed over. So is a subfolder, which `migrate` does not
+  search; its notes were left out with exit 0. Both import a note once however many links name
+  it, in whatever case or Unicode form (INV-08, INV-11).
+- **A folder an importer cannot read is reported:** `import-vault`,
+  `migrate` and `skills add` name it "cannot be read; not imported" and exit
+  1, where they passed over it and exited 0. An unreadable `SKILL.md` is
+  reported skipped instead of aborting the pack (INV-08).
+  Auto-discovery also reports an unreadable `~/.claude/projects` or an
+  inaccessible parent through the import failure reports: `migrate` and
+  `init --migrate-existing` exit 1 instead of treating it as no memories.
+- **Unresolved vault attachments fail the note:** unreadable, missing,
+  unsupported or out-of-vault body embeds are reported with exit 1, just
+  like unresolved frontmatter attachments, instead of silently disappearing
+  from the import and its backup. An explicit `attachments` list still
+  overrides body embeds (INV-08, INV-14).
+- **`write` at a terminal approves only a kind you name:** over a record an
+  agent created, without `--kind`, it no longer approves the agent's kind;
+  `trust` shows it and approves both (INV-01).
+- **MCP and HTTP clear a field the same way:** a present key names the
+  field and `null` clears it. An empty or null kind or visibility is refused
+  everywhere, and HTTP no longer coerces types (`ttl_days: true`).
+- `skillmem write --agent` without a TTY is refused on an existing record;
+  `--limit` below 1 is refused.
+- **Export directories have one owner.** A second database exporting into
+  another's directory is refused instead of overwriting its backup. A
+  database rebuilt from its dump after the original was lost is refused until
+  you run `skillmem export-all <dir>` yourself once.
+- **A copied database file** (`cp`, SQLite backup) copies the document bodies
+  it shares with the original when first opened, and refuses to open if it
+  cannot (read-only copy, missing body).
+- **Scheduled jobs** for a database other than the default are named per
+  database (see Known issues). Concurrent cron installs and removals now
+  share a user-wide lock, preserving other databases' jobs even with
+  different `SKILLMEM_HOME` settings (INV-12).
+- **A GitHub token is tied to one repository.** A token file from 0.11 is
+  sent nowhere: store it again with `skillmem token set --repo OWNER/NAME`.
+- Opening an old database repairs out-of-range strength and TTL and invalid
+  kinds (`how/to` becomes `how-to`), and stores an empty project, author or
+  session (`write --project ""` in 0.11.3) as none, the one a backup restores.
+- The recall hooks' "already shown" ledger has a new format; the old one is
+  ignored, so an open session may see a rule once more.
+- Library: `MemoryItem.confidence` and `supersedes_id` are removed.
+
+### What is now guaranteed
+
+[`docs/INVARIANTS.md`](docs/INVARIANTS.md) states sixteen invariants, which
+function enforces each, and their status at this release (section 6);
+`tests/properties/` checks them with hypothesis and real concurrent writers.
+A release needs zero P1/P2 findings in three classes (section 7):
+
+- **data**: no record, field, history row, body file or backup is lost,
+  overwritten or silently not written; export → `import-vault` → export
+  gives the same bytes.
+- **trust**: only the owner at a terminal approves or seals; a sealed record
+  changes only by the owner; unapproved titles and bodies reach a model only
+  inside the frame, and an excerpt is never served as the verified text.
+- **concurrency**: every read-then-write decision is made inside the write's
+  transaction or by compare-and-swap.
+
+### Fixes
+
+- The session-recap debounce holds when the stamp reads a few milliseconds
+  ahead of the clock, as a just-written file can on Windows; it let a
+  second recap (and model call) through.
+- Python 3.11–3.13 and Windows: `migrate`, `init --migrate-existing`,
+  `import-vault` and `skills add` report a folder they may list but not
+  search instead of stopping with a `PermissionError` (before 3.14,
+  `Path.is_dir()` raised there) (INV-08). On Windows, `inject` writes `\n`,
+  not `\r\n`; an attachment is stored as `assets/ab/….png`, not
+  `assets\ab\….png`, so it round-trips; `import-vault` names a failed file
+  `a/b.md` as on every other OS; an export recognises its own dump that a
+  checkout converted to `\r\n`; a command closes its database when it ends,
+  and the HTTP server when each request ends (it kept one connection per
+  worker thread open for its lifetime), so a process that runs them (a test
+  runner, a tool) can delete the file; and
+  `uninstall --purge-db` deletes the database before its body files and stops
+  with a message while another process holds the database open, where its
+  records were left without their text (INV-06, INV-10, INV-11).
+- Export preserves a complete earlier backup when a concurrent same-text
+  repair restores a missing body file after export captured its excerpt,
+  including when a case twin changes the dump filename (INV-06).
+- Session-history and transcript discovery match names with Unicode
+  normalization and casefolding, so `SESSION-*.MD` and `*.JSONL` are found
+  consistently across filesystems (INV-11).
+- A record renamed to a case or Unicode-normalisation variant of its slug
+  (`Foo` deleted, `foo` written) is dumped under its new spelling on APFS
+  and NTFS too; the old spelling stayed on disk, listed in no manifest, so
+  a case-sensitive copy of the backup kept a stale file no export pruned
+  (INV-11).
+- A backup restored over a record rewritten since with the same text under
+  another kind gives the record its dump's body: a note is no longer left
+  stored as a 4 KB excerpt beside a body file. Whether a body goes in a file
+  now depends only on its kind and length, and the first open by this
+  release (schema v12) moves each body an earlier version placed otherwise
+  (INV-06).
+- Trust: `upsert` decides every refusal on the row it reads under the write
+  lock. On Windows the CLI took `< NUL` for a terminal and stored agent
+  writes approved and sealed. `trust` escapes control and invisible
+  characters in what it shows, and pins the kind too. New text hashes encode
+  title and body unambiguously; old hashes still verify. Opening a database
+  that repairs a stored kind (`Feedback` to `feedback`) drops that record's
+  approval: an approved note had become an approved, injected rule.
+- Frame: a copy of the closing marker is escaped after any Unicode line
+  break, with angle-bracket look-alikes (`⨠` and `⪥` count as the two
+  brackets they show; `⊁` DOES NOT SUCCEED is one), invisible characters or control sequences. Search output, listings, history and an unapproved record's
+  links are framed, and so is a pack's licence line in the `skills add`
+  report. A record's links are the words of its stored text:
+  `<private>` text inside a `[[link]]` outlived the scrub and was served
+  unframed once you approved the record, and a pack update kept the links
+  of the text it replaced. Recall applies the per-kind limit after separating
+  approved from unapproved rows, so agent records cannot crowd out a rule.
+- Reads: search, recall and listings re-check the caller's filter on the row
+  they return; `cat`, `mem_get` and `/get` read one snapshot. A missing or
+  damaged document body is served as its excerpt with a notice, everywhere.
+  MCP tool failures carry `isError: true`.
+- Writes: a text edit keeps every field the caller did not name. `learn`
+  refuses a slug holding another kind on every surface. `write --body-file`
+  and stdin keep CRLF. A database from before schema v5 upgrades instead of
+  failing with "database disk image is malformed".
+  Interrupted transactions and nested savepoints roll back before propagating
+  Ctrl-C, exit or cancellation; reusing the connection no longer acknowledges
+  later writes that disappear when it closes (INV-08). A COMMIT that fails or
+  is interrupted rolls back too; it left the write lock held the same way.
+  A failed or interrupted nested RELEASE also rolls back its scope's writes
+  and history, preserving the outer transaction (INV-08).
+- Imports: names match case-insensitively on every system, the exact
+  spelling first. Attachment and pack lookups share export's Unicode
+  normalization and casefolding, so aliases such as `Σ.png` / `ς.png`
+  keep their assets in the imported record and backup (INV-11).
+  A pack's oversized skills, slug collisions, non-UTF-8 files
+  and links out of the pack are reported skipped. A skill whose own folder
+  is named `build`, `test`, `dist` or the like is imported, not left out
+  unreported.
+- Backups: dumps, attachments, the manifest, token files and scheduler files
+  are written to a scratch name and renamed. A restore brings back the
+  record's times, attachments, session and a cleared deadline. Slugs that
+  differ only in case or Unicode normalisation, or are too long for a file
+  name, get distinct files. Canonical filename comparisons also protect
+  another database's backups and keep pruning from deleting a new dump.
+  Body-file GC uses the same comparison, preserving a live document after
+  its filename changes Unicode normalisation or case (INV-11).
+  An interrupted export's files stay listed as its own. Your export over a
+  pre-0.12 manifest takes over only the files that hold your records;
+  another database's and unreadable ones stay reserved, not pruned. A lost body or
+  damaged attachment no longer replaces an intact backup, and neither does
+  an export that finds the write lock busy: it fails instead. A slug made of
+  dots gets a file name the restore reads. A restore fails a dump whose
+  `owner_seal`, `origin` or `lifecycle` is not a valid value, instead of
+  sealing on `'false'` or restoring `Archived` as active. A dump without
+  `metadata.type`, `metadata.origin`, `originSessionId` or `strength` keeps
+  the record's own value: `--kind` relabelled a stored rule as a document,
+  and a missing origin made an agent's record the owner's and sealed it
+  (INV-14). That holds when the record's text changed after the backup too:
+  the restore put back the old text labelled `owner`, and a pack skill so
+  restored was no longer removed with its pack. A library `upsert` that
+  changes the text without naming `origin` keeps the row's, and an origin
+  it does not name no longer seals the record. Each database's
+  weekly export has its own directory (`backups/vault-<tag>` beside the
+  default database's `backups/vault`). `uninstall --purge-db` deletes only
+  its own body files, never a pre-0.11 file a copy's original still serves.
+  A byte copy of a database (`cp`) is another database even at a moved
+  original's old path: its export no longer takes over and prunes the
+  original's backup, and its GC no longer deletes the original's body files.
+  A database moved to another file system counts as a copy: its first
+  export into its old directory asks for you at a terminal.
+  `uninstall --purge-db` with no database at the default path, or at a
+  `--db` path, no longer takes the empty file it opens for the pre-0.12
+  database that was there and deletes a moved one's body files. A restore
+  committed while an export runs no longer makes the export take another
+  database's dump of that record for its own and prune it: the records it
+  dumps and the ones it calls its own are one read. An export refuses to publish an
+  attachment over a different file another database's export lists, and a
+  record's dump never takes an attachment's name (a record of kind `assets`
+  replaced `assets/X.md` on macOS and Windows). An export into a directory
+  where another database dumped a record under one of its slugs is refused,
+  whatever the kind folder: a restore of the directory put that record over
+  yours (INV-12). One database file is one database however its path is
+  spelled: on macOS `--db M.db` and `m.db` got two namespaces, so the body
+  files were copied as a copy's, and a lost one kept the other spelling from
+  opening at all. A token file's empty agent name is refused (its own
+  records answered 404).
+- Concurrency: schema migrations run in one transaction; the HTTP and MCP
+  servers check permission and write in one; recap locks are OS locks the
+  kernel releases when a holder dies, and a Stop recap reads the rate-limit
+  stamp again once it holds its session's lock (two Stops made two model
+  calls within the limit); `init` and `uninstall` patch configs by
+  compare-and-swap; embeddings are computed after the write lock is released.
+  A Ctrl-C while a write waits for another process's lock no longer leaves
+  the transaction open, where a library or REPL caller's later writes were
+  acknowledged and lost when the connection closed (INV-08).
+- Hooks: every hook and `inject` runs inside one fail-open boundary (bad
+  input, a broken database, a bad `--db`: exit 0 within the timeout). Hooks
+  load the embedding model from cache only; a session's "already shown"
+  list lives in the private state directory only, never the shared temp
+  directory, where anyone could pre-create it and hide a rule; `auto-recall` reads the first
+  2,000 characters of a prompt; the briefing is UTF-8 on every platform. The
+  plugin installs the `SessionEnd` recap. `skillmem recap` exits non-zero
+  with the reason when it wrote no recap (no `claude` on the PATH, a failed
+  model call, a refused index write, a short transcript); it said "recap run"
+  and exited 0 (INV-08).
+- Setup: `migrate` without `--source` imports every
+  `~/.claude/projects/*/memory`; with no terminal it imports nothing and now
+  exits non-zero (it exited 0 with a warning, INV-08). `--db X init
+  --claude-code` wires the hooks to the database its MCP entry names (they
+  wrote recaps into the default one and recalled nothing from X, INV-12);
+  a later `init` repoints them rather than doubling them. Cron and systemd entries survive a space,
+  `%` or `$` in the data directory. A relative `SKILLMEM_DB` or
+  `SKILLMEM_HOME` is made absolute where it is read, so a scheduled job,
+  which runs from another directory, backs up the database it was installed
+  for (it exported a new, empty one). `upgrade` sends a stored GitHub token
+  across a redirect only to the same scheme, host and port.
+
+### Platform and CI
+
+CI runs the whole suite, property tests and hook fuzzing included, on Linux,
+macOS and Windows with Python 3.11–3.13, plus a semantic-search job, a build
+and a Docker check that the image lists nine tools with stdin held open. The
+PyPI release reruns all of it on the tag. `scripts/release-gate.sh` requires
+each new test to fail on the commit before its fix.
+
+### Known issues
+
+- The deny rules and the TTY check are not a wall against an agent with a
+  shell: `script -qec "skillmem tr''ust x" /dev/null` passes both (INV-02).
+- `inject` calls a note `import-vault` sealed "rewritten since you
+  approved" it (INV-01).
+- A strength an agent lowered before you sealed a record carries into your
+  rewrite (INV-03).
+- `find_conflicts` also matches archived rows (INV-04).
+- A library `import_vault` with no terminal restores a dump's `origin: owner`
+  for a kind that is not a note, without the seal (INV-02). Likewise a library
+  `upsert` with no terminal stores a caller's `origin="owner"` on a new row,
+  unsealed and unapproved (INV-02).
+- An SQLite error that ends the whole transaction during one file's savepoint
+  in `import-vault` rolls back the files imported before it and commits the
+  ones after (INV-08).
+- An editor save between the patcher's last check and its rename is lost,
+  and so is one of two `skillmem` config patches that run at the same moment.
+  Processes opening a brand-new database at the same moment can fail with
+  "database is locked" (the switch to WAL does not wait); the database is
+  not damaged, and a retry opens it (INV-05).
+- Two clients writing the same new slug at once over MCP can get a
+  near-duplicate refusal naming the other's, identical, record; `trust` can
+  report "no memory" after sealing a record your other terminal removed in
+  that instant; `mem_update`'s `history_entries` can count a concurrent edit
+  (INV-04, INV-05).
+- A restore renames a library-written attachment whose name is not its hash,
+  and fails a dump whose attachment is `.txt` or has no extension; an
+  attachment lost from both the store and the earlier backup is left out of
+  an export without a warning (`verify` does not check attachments), and the
+  restore then fails that file;
+  a numeric tag from a pre-0.12 library write comes back as a string, and a
+  `true` or `null` one fails its record's restore (INV-06).
+- Slugs, kind, project, tags, topics, author and session are shown unframed
+  (INV-07).
+- A slug keeps surrounding whitespace, so `write --slug "x "` makes a record
+  `cat x` cannot find. After a restore gives a pack skill another author,
+  re-installing the pack refuses it. A CLI write that times out on the lock
+  prints a traceback. `migrate` and packs normalise line endings (INV-08).
+- `skills rm` skips a pack skill you approved without saying so; the count
+  it prints is right (INV-08).
+- A hook whose stdout reader has gone exits 120 with a `BrokenPipeError`,
+  and one serving records whose body files are missing writes a stderr line
+  per record (INV-10).
+- A non-default database scheduled with 0.11 keeps its old jobs until
+  `skillmem schedule remove` runs against the default database (INV-12).
+  External crontab editors do not take skillmem's advisory lock; avoid
+  editing the crontab while installing or removing its jobs (INV-05).
+- `cat --history` does not show old text; restoring a deleted, archived
+  record appends two history rows (INV-13).
+- The library `upsert` stores `freshness_until="next week"`, and a float or
+  string `created_at`, `updated_at`, counter or recency time, which no
+  restore accepts; a note's `ttl_days: "1_0"` is stored as 10 (INV-14).
+- MCP accepts a
+  visibility such as `" Public "` or `Shared` that HTTP refuses (INV-14).
+- Rotating `hooks.log` can lose a line another hook appends during the
+  rotation (INV-16).
+- The "already shown" ledger is not locked: pruning old session ledgers
+  unlinks one after a `stat()`, so a line appended in between is lost and
+  the rule is injected again, and `tool-recall` reads, decides and appends
+  it unlocked, so parallel PreToolUse hooks can inject the same rule twice
+  (INV-05).
+- Windows: a `SKILLMEM_VERIFY_PATTERN` that backtracks catastrophically is
+  not cut off by skillmem's own watchdog (there is no SIGALRM, and the regex
+  holds the interpreter lock the watchdog thread needs); Claude Code's hook
+  timeout, 10 s in the shipped wiring, ends it. `uninstall --purge-db`
+  refuses while the MCP server (it keeps the database open for its session)
+  or an HTTP request in progress has the database open: stop it and run it
+  again (INV-10).
+
 ## 0.11.3
 
 - Fix recall budget composition emitting the same record twice and dropping
@@ -9,6 +348,15 @@
   so clients keeping stdin open never received an initialization response.
 
 ## 0.11.2
+
+- The container holds stdin open while the server starts. A scanner that writes
+  its requests and closes stdin at once raced the MCP SDK's own 0.4s import: the
+  reader did not exist yet when EOF landed, only the first request was answered,
+  and a catalogue listing showed zero tools for a server that has nine. Measured
+  in the image, cold start, three runs each: without the shim one run answered
+  and two did not; with it, three out of three. That claim shipped with a sentence saying ordinary
+  clients never took this path; they did, because the shim WAS the
+  entrypoint, and 0.11.3 removes it.
 
 - Recall could hand back the rules and throw away the answer. The hook composer
   filled its character budget section by section in order: three feedback rows
@@ -25,14 +373,6 @@
   other.
 
 ## 0.11.1
-
-- The container holds stdin open while the server starts. A scanner that writes
-  its requests and closes stdin at once raced the MCP SDK's own 0.4s import: the
-  reader did not exist yet when EOF landed, only the first request was answered,
-  and a catalogue listing showed zero tools for a server that has nine. Measured
-  in the image, cold start, three runs each: without the shim one run answered
-  and two did not; with it, three out of three. Image only — ordinary clients
-  keep the connection open and never take that path.
 
 - **Windows: the owner signal was fooled by the null device.** `isatty()` is true
   for any character device there, NUL included, so an agent running the CLI with

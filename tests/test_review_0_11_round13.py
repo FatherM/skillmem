@@ -92,17 +92,16 @@ def test_owner_terminal_update_preserves_the_supplied_approval(home, monkeypatch
         S.MemoryItem(slug="rule", kind="feedback", title="Rule",
                      body="agent-v1: unapproved text",
                      origin="agent"),
-        owner_call=False,
     )
-    # Owner updates through a terminal, carrying the CLI-minted trust stamp.
+    # Owner updates through the CLI at a terminal. The approval is stamped by
+    # storage (surface "cli" + owner_present()), never taken from the item.
     monkeypatch.setattr(S, "owner_present", lambda: True)
     S.upsert(
         conn,
         S.MemoryItem(slug="rule", kind="feedback", title="Rule",
                      body="owner-v2: the words the owner actually approves",
-                     origin="owner", trusted_at=1789697840,
-                     trusted_by="cli-tty"),
-        owner_call=True, reason="owner-edit", force=True,
+                     origin="owner"), surface="cli", reason="owner-edit", force=True,
+        explicit={"kind"},    # `--kind feedback`: the kind approved is one named (INV-01)
     )
     row = conn.execute(
         "SELECT body, origin, owner_seal, trusted_at, trusted_by "
@@ -112,7 +111,7 @@ def test_owner_terminal_update_preserves_the_supplied_approval(home, monkeypatch
     assert row["origin"] == "owner"
     assert row["owner_seal"] == 1
     # The write from a terminal is the approval — the row keeps it.
-    assert row["trusted_at"] == 1789697840
+    assert row["trusted_at"] is not None
     assert row["trusted_by"] == "cli-tty"
     brief = S.briefing(conn, kinds=["feedback"])
     assert not brief.get("awaiting_reapproval"), brief
@@ -122,9 +121,11 @@ def test_owner_terminal_update_preserves_the_supplied_approval(home, monkeypatch
 
 
 def test_agent_overwrite_still_clears_trust(home, monkeypatch):
-    """The mirror side of the fix: only the owner-at-terminal write carries
-    its own approval. An agent overwriting the body still resets trust — the
-    approval belonged to the previous words, not to the slug."""
+    """The mirror side of the fix: only the owner writing through the CLI
+    carries its own approval. An agent can no longer overwrite the sealed
+    record at all (INV-03); the owner rewriting it any other way (a restore,
+    a library call) still resets trust — the approval belonged to the
+    previous words, not to the slug."""
     conn = _conn(home)
     # Owner writes and approves at the terminal.
     monkeypatch.setattr(S, "owner_present", lambda: True)
@@ -132,30 +133,38 @@ def test_agent_overwrite_still_clears_trust(home, monkeypatch):
         conn,
         S.MemoryItem(slug="rule", kind="feedback", title="Rule",
                      body="owner-v1: original approved words",
-                     origin="owner", trusted_at=1789697000,
-                     trusted_by="cli-tty"),
-        owner_call=True,
+                     origin="owner"), surface="cli",
     )
     assert conn.execute(
         "SELECT trusted_at FROM memory_items WHERE slug='rule'"
-    ).fetchone()["trusted_at"] == 1789697000
-    # Agent overwrites — no terminal.
+    ).fetchone()["trusted_at"] is not None
+    # Agent overwrites — no terminal: refused, nothing moves.
     monkeypatch.setattr(S, "owner_present", lambda: False)
+    with pytest.raises(S.SealedRecord):
+        S.upsert(
+            conn,
+            S.MemoryItem(slug="rule", kind="feedback", title="Rule",
+                         body="agent-v2: replacement text from an unattended run",
+                         origin="agent"), reason="agent-edit", force=True,
+        )
+    assert conn.execute(
+        "SELECT trusted_at FROM memory_items WHERE slug='rule'"
+    ).fetchone()["trusted_at"] is not None
+    # The owner rewriting it through a surface that does not approve
+    monkeypatch.setattr(S, "owner_present", lambda: True)
     S.upsert(
         conn,
         S.MemoryItem(slug="rule", kind="feedback", title="Rule",
-                     body="agent-v2: replacement text from an unattended run",
-                     origin="agent"),
-        owner_call=False, reason="agent-edit", force=True,
+                     body="owner-v2: restored from an older backup",
+                     origin="owner"), reason="restore", force=True,
     )
     row = conn.execute(
         "SELECT body, origin, owner_seal, trusted_at, trusted_by "
         "FROM memory_items WHERE slug='rule'"
     ).fetchone()
-    assert row["body"] == "agent-v2: replacement text from an unattended run"
-    # The seal survives an agent overwrite (that is the point of the seal).
+    assert row["body"] == "owner-v2: restored from an older backup"
     assert row["owner_seal"] == 1
-    # But the approval is gone: the words changed and no owner was there.
+    # The approval is gone: the words changed and nobody approved these.
     assert row["trusted_at"] is None
     assert row["trusted_by"] is None
 
@@ -177,7 +186,6 @@ def test_owner_terminal_same_text_write_applies_the_supplied_approval(
         conn,
         S.MemoryItem(slug="same", kind="feedback", title="Same",
                      body=body, origin="agent"),
-        owner_call=False,
     )
     row = conn.execute(
         "SELECT owner_seal, trusted_at FROM memory_items WHERE slug='same'"
@@ -189,16 +197,15 @@ def test_owner_terminal_same_text_write_applies_the_supplied_approval(
     S.upsert(
         conn,
         S.MemoryItem(slug="same", kind="feedback", title="Same",
-                     body=body, origin="owner",
-                     trusted_at=1789700000, trusted_by="cli-tty"),
-        owner_call=True,
+                     body=body, origin="owner"), surface="cli",
+        explicit={"kind"},    # `--kind feedback`: the kind approved is one named (INV-01)
     )
     row = conn.execute(
         "SELECT owner_seal, trusted_at, trusted_by "
         "FROM memory_items WHERE slug='same'"
     ).fetchone()
     assert row["owner_seal"] == 1
-    assert row["trusted_at"] == 1789700000
+    assert row["trusted_at"] is not None
     assert row["trusted_by"] == "cli-tty"
 
 def test_the_owner_signal_is_not_fooled_by_a_null_device():

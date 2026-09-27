@@ -8,6 +8,14 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_leaked_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`skillmem --db X` sets SKILLMEM_DB for the rest of the process (so jobs
+    and default_db_path() see X); under CliRunner that process is the suite,
+    and the next test inherited X — schedule job names follow it (INV-12)."""
+    monkeypatch.delenv("SKILLMEM_DB", raising=False)
+
+
 @pytest.fixture
 def memhome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolate SKILLMEM_HOME under tmp so tests never touch the real DB."""

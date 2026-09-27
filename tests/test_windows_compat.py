@@ -83,7 +83,9 @@ def test_launchd_plist_roundtrip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     import plistlib
     calls: list[list[str]] = []
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("SKILLMEM_HOME", str(tmp_path / "data"))
+    monkeypatch.setattr(SCHED.S, "user_data_dir", lambda *a, **kw: str(tmp_path / "data"))
     monkeypatch.setattr(SCHED.subprocess, "run",
                         lambda cmd, **kw: calls.append(cmd) or
                         __import__("types").SimpleNamespace(returncode=0))
@@ -100,6 +102,9 @@ def test_schtasks_command_carries_the_data_dir_overrides(monkeypatch: pytest.Mon
     monkeypatch.setattr(SCHED.sys, "platform", "win32")
     monkeypatch.setenv("SKILLMEM_HOME", r"C:\Data\sm")
     monkeypatch.setenv("SKILLMEM_DB", r"C:\Data\sm\other.db")
+    # on Windows these are absolute and pass through; on a POSIX host they
+    # read as relative and would be joined to the cwd (INV-12)
+    monkeypatch.setattr(SCHED.S, "_absolute", Path)
     calls: list[list[str]] = []
 
     class _P:

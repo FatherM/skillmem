@@ -253,7 +253,9 @@ def test_settings_backups_do_not_overwrite_each_other_within_a_second(fakehome: 
     _cli._patch_settings_hook(settings_json, Path("/v/bin/skillmem"), event="Stop", args=["hook", "a"])
     _cli._patch_settings_hook(settings_json, Path("/v/bin/skillmem"), event="Stop", args=["hook", "b"])
     backups = sorted(settings_json.parent.glob("settings.json.bak.*"))
-    assert len(backups) == 3
+    # one per file per run: the first copy is the original, later ones were
+    # init's own intermediate steps (26 of them for one real init)
+    assert len(backups) == 1
     assert backups[0].read_text() == original
 
 

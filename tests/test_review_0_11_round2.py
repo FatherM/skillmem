@@ -13,6 +13,7 @@ from skillmem import storage as S
 from skillmem import hooks as H
 from skillmem import export as E
 from skillmem.cli import main as cli_main
+from tests import as_owner, owner_trusts
 
 
 @pytest.fixture
@@ -155,7 +156,7 @@ def test_frame_keeps_title_when_body_is_empty():
 def test_untrust_refuses_without_tty(home):
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="rule", title="t", body="b", kind="feedback"))
-    S.set_trust(conn, "rule", trusted=True)
+    owner_trusts(conn, "rule", trusted=True)
     conn.commit()
     r = CliRunner().invoke(cli_main, ["--db", str(home / "memory.db"), "trust", "--untrust", "rule"])
     assert r.exit_code != 0
@@ -174,6 +175,7 @@ def test_db_flag_reaches_scheduled_job_env(home, monkeypatch):
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cwd; Windows resolves /Users/x to C:\\Users\\x")
 def test_transcript_dir_name_matches_claude_code_sanitiser(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     proj = tmp_path / ".claude" / "projects" / "-Users-x--claude-projects--Users-x"
     proj.mkdir(parents=True)
     (proj / "s.jsonl").write_text("{}", encoding="utf-8")
@@ -236,6 +238,7 @@ def test_pack_aggregate_budget(tmp_path, monkeypatch):
 
 def test_uninstall_purge_removes_only_this_dbs_body_files(home, monkeypatch):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(S, "owner_present", lambda: True)   # purging is the owner's
     default = _conn(home)
     other = _conn(home, "other.db")
     S.upsert(default, S.MemoryItem(slug="doc", title="d", body=BIG("a"), kind="document"))
@@ -291,6 +294,7 @@ def test_export_two_homes_one_destination_keep_both(tmp_path, monkeypatch):
 
 def test_purge_default_db_keeps_legacy_files_of_other_dbs(home, monkeypatch):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(S, "owner_present", lambda: True)   # purging is the owner's
     default = _conn(home)
     other = _conn(home, "other.db")
     S.upsert(other, S.MemoryItem(slug="leg", title="l", body=BIG("old"), kind="document"))
@@ -434,7 +438,7 @@ def test_init_db_rerun_updates_existing_mcp_entry(home, monkeypatch):
     assert cfg["mcpServers"]["skillmem"]["env"]["SKILLMEM_DB"] == str(home / "b.db")
 
 
-def test_export_adopts_pre_release_manifest(home):
+def test_export_preserves_unproved_pre_release_manifest(home):
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="a", title="t", body="b", kind="note"))
     dest = home / "vault"
@@ -443,13 +447,13 @@ def test_export_adopts_pre_release_manifest(home):
     (dest / ".skillmem-export.json").write_text(json.dumps({"files": ["note/stale.md"]}),
                                                 encoding="utf-8")
     E.export_all(conn, dest)
-    assert not (dest / "note" / "stale.md").exists()
+    assert (dest / "note" / "stale.md").read_text() == "old export"
     assert (dest / "note" / "a.md").exists()
 
 
-def test_version_is_0_11():
+def test_version_is_0_12():
     from skillmem import __version__
-    assert __version__.startswith("0.11.")
+    assert __version__.startswith("0.12.")
 
 
 # --- round 5: hash width, merged index, restore, tx, namespaces, init env -----
@@ -471,7 +475,7 @@ def test_metadata_update_indexes_merged_tags_and_topics(home):
     S.upsert(conn, S.MemoryItem(slug="k", title="deploy", body="apply", kind="skill",
                                 tags=["kubernetes"]))
     S.upsert(conn, S.MemoryItem(slug="k", title="deploy", body="apply", kind="skill",
-                                topics=["postgresql"]))
+                                topics=["postgresql"]), explicit={"topics"})
     assert [h["slug"] for h in S.search(conn, "kubernetes")] == ["k"]   # kept tag still indexed
     assert [h["slug"] for h in S.search(conn, "postgresql")] == ["k"]
 
@@ -484,7 +488,7 @@ def test_update_returns_the_persisted_strength(home):
     item = S.upsert(conn, S.MemoryItem(slug="k", title="t", body="v2", kind="skill"), force=True)
     assert item.strength == 1.9
     item = S.upsert(conn, S.MemoryItem(slug="k", title="t", body="v2", kind="skill", strength=0.4),
-                    force=True, restore_strength=True)        # same text, explicit restore
+                    force=True, explicit={"strength"})        # same text, explicit restore
     assert conn.execute("SELECT strength FROM memory_items WHERE slug='k'").fetchone()[0] == 0.4
 
 
@@ -714,6 +718,7 @@ def test_kind_repair_catches_newlines_and_nbsp(home):
 # --- round 8: Codex edit must change nothing but SKILLMEM_DB ---------------
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require Windows developer mode or elevated privileges")
 def test_atomic_write_follows_symlink_and_keeps_mode_and_crlf(home):
     import os, stat
     from skillmem import cli as cli_mod
@@ -797,7 +802,7 @@ def test_history_is_framed_even_after_the_current_version_is_approved(home, monk
                                 kind="skill", origin="agent"))
     S.upsert(conn, S.MemoryItem(slug="sk", title="safe", body="safe body", kind="skill", origin="agent"),
              force=True)
-    S.set_trust(conn, "sk", trusted=True)
+    owner_trusts(conn, "sk", trusted=True)
     conn.commit()
     from skillmem import mcp_server as M
     monkeypatch.setenv("SKILLMEM_DB", str(home / "memory.db"))
@@ -809,6 +814,7 @@ def test_history_is_framed_even_after_the_current_version_is_approved(home, monk
     assert "UNAPPROVED OLD TITLE" not in h0["old_title"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require Windows developer mode or elevated privileges")
 def test_http_list_carries_trusted_and_json_writes_follow_symlinks(home, monkeypatch):
     fastapi_testclient = pytest.importorskip("fastapi.testclient")
     from skillmem import server as srv, cli as cli_mod
@@ -953,7 +959,7 @@ def test_same_text_write_only_applies_fields_the_caller_sent(home, monkeypatch):
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="sk1", title="deploy", body="steps", kind="skill",
                                 visibility="public", agent="alice", origin="owner"))
-    S.set_trust(conn, "sk1", trusted=True)
+    owner_trusts(conn, "sk1", trusted=True)
     conn.commit()
     monkeypatch.setenv("SKILLMEM_DB", str(home / "memory.db"))
     monkeypatch.setattr(M, "_CONN", None)
@@ -965,7 +971,7 @@ def test_same_text_write_only_applies_fields_the_caller_sent(home, monkeypatch):
     # a private trusted skill stays private through a same-text mem_learn
     S.upsert(conn, S.MemoryItem(slug="skp", title="t", body=S.skill_body("tr", "st", "ok", None),
                                 kind="skill", visibility="private", origin="owner"))
-    S.set_trust(conn, "skp", trusted=True); conn.commit()
+    owner_trusts(conn, "skp", trusted=True); conn.commit()
     M._tool_learn({"slug": "skp", "title": "t", "trigger": "tr", "steps": "st", "outcome": "ok"})
     assert conn.execute("SELECT visibility FROM memory_items WHERE slug='skp'").fetchone()[0] == "private"
     # CLI write without --kind on a trusted public skill keeps it a public skill
@@ -1023,7 +1029,7 @@ def test_dump_round_trip_keeps_exact_slugs_whitespace_trust_pin_counters_origin(
     S.upsert(conn, S.MemoryItem(slug="a_b", title="t", body="underscore body", kind="note"))
     S.upsert(conn, S.MemoryItem(slug="rule-1", title="r", body="never force push\n", kind="feedback",
                                 origin="owner"))
-    S.set_trust(conn, "rule-1", trusted=True)
+    owner_trusts(conn, "rule-1", trusted=True)
     S.upsert(conn, S.MemoryItem(slug="sk", title="s", body="b", kind="skill", origin="unknown"))
     S.set_pinned(conn, "sk", True)
     S.reinforce(conn, "sk", evidence="test_passed")
@@ -1046,8 +1052,8 @@ def test_dump_round_trip_keeps_exact_slugs_whitespace_trust_pin_counters_origin(
 
 
 def test_seen_ledger_accepts_any_slug_and_decay_days_are_clamped(home):
-    ctx = "- [skill_Under.Score] title\n- [feedback-ok] t\n"
-    assert set(H._extract_slugs(ctx)) == {"skill_Under.Score", "feedback-ok"}
+    H._append_seen("session", ["skill_Under.Score", "feedback-ok"])
+    assert H._read_seen("session") == {"skill_Under.Score", "feedback-ok"}
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="s", title="t", body="b", kind="skill"))
     conn.execute("UPDATE memory_items SET created_at = created_at - 5 * 86400"); conn.commit()
@@ -1075,27 +1081,33 @@ def test_learn_project_applies_and_write_ttl_error_is_a_conflict_line(home):
     assert r.exit_code == 2 and "CONFLICT: invalid ttl_days" in r.output and "Traceback" not in r.output
 
 
-def test_mcp_null_is_not_explicit_and_old_dumps_keep_pins(home, monkeypatch, tmp_path):
+def test_mcp_null_enums_are_refused_and_old_dumps_keep_pins(home, monkeypatch, tmp_path):
     from skillmem import mcp_server as M, vault as V
     conn = _conn(home)
     body = S.skill_body("x", "y", "z", None)          # what mem_learn will generate
     S.upsert(conn, S.MemoryItem(slug="sk", title="t", body=body, kind="skill", visibility="private",
                                 origin="owner"))
-    S.set_trust(conn, "sk", trusted=True); S.set_pinned(conn, "sk", True); conn.commit()
+    owner_trusts(conn, "sk", trusted=True)
+    with as_owner():
+        S.set_pinned(conn, "sk", True)
+    conn.commit()
     monkeypatch.setenv("SKILLMEM_DB", str(home / "memory.db"))
     monkeypatch.setattr(M, "_CONN", None)
+    # a key sent as null names the field (C6); a kind cannot be cleared, so
+    # null is refused like "" on every surface (C5)
     out = json.loads(M._tool_write({"slug": "sk", "title": "t", "body": body, "kind": None})[0].text)
-    assert out.get("ok") is True, out
+    assert "invalid kind" in out.get("error", ""), out
+    # Visibility has no null value either: it must not silently become private.
     out = json.loads(M._tool_learn({"slug": "sk", "title": "t", "trigger": "x", "steps": "y",
                                     "outcome": "z", "visibility": None})[0].text)
-    assert out.get("ok") is True, out
+    assert "invalid visibility" in out.get("error", ""), out
     row = conn.execute("SELECT kind, visibility FROM memory_items WHERE slug='sk'").fetchone()
     assert (row["kind"], row["visibility"]) == ("skill", "private")
     # a dump written before pins were exported must not unpin on re-import
     dump = tmp_path / "old"
     (dump / "skill").mkdir(parents=True)
     (dump / "skill" / "sk.md").write_text(
-        "---\nname: sk\ndescription: t\nmetadata:\n  node_type: memory\n  type: skill\n  origin: owner\n"
+        "---\nname: sk\ndescription: t\nexported_at: 1\nmetadata:\n  node_type: memory\n  type: skill\n  origin: owner\n"
         "strength: 1.0\n---\n\n" + body + "\n", encoding="utf-8")
     V.import_vault(conn, dump, skip_auto_memories=False)
     assert conn.execute("SELECT pinned, origin FROM memory_items WHERE slug='sk'").fetchone()[0] == 1
@@ -1109,7 +1121,7 @@ def test_migrate_on_identical_text_keeps_provenance(home, tmp_path):
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="rule-x", title="r", body="never force push", kind="skill",
                                 origin="owner"))
-    S.set_trust(conn, "rule-x", trusted=True); conn.commit()
+    owner_trusts(conn, "rule-x", trusted=True); conn.commit()
     src = tmp_path / "memory"
     src.mkdir()
     (src / "rule-x.md").write_text("---\nname: rule-x\ndescription: r\n---\n\nnever force push\n",

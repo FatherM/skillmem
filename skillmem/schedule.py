@@ -2,7 +2,7 @@
 
 Sets up two recurring jobs without manual launchd/schtasks/cron plumbing:
   - decay:  daily 04:15 — `skillmem decay --days 14` (Ebbinghaus + lifecycle)
-  - export: weekly Sun 04:30 — `skillmem export-all <data>/backups/vault`
+  - export: weekly Sun 04:30 — `skillmem export-all <data>/backups/vault[-<tag>]`
 
 Per-platform backends:
   darwin -> launchd user agents (~/Library/LaunchAgents/com.skillmem.*.plist)
@@ -11,12 +11,17 @@ Per-platform backends:
             when `systemctl --user` works; otherwise crontab -l | crontab -
             (lines marked with "# skillmem:"); neither -> explicit error
 
+Each database gets its own jobs: a database other than the default one adds a
+digest of its path to every job name (``_database_tag``), and install, remove
+and status touch only the current database's jobs.
+
 Offsite backups (ssh etc.) are deliberately out of scope: that is personal
 infrastructure, not the product.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import plistlib
 import shlex
@@ -24,30 +29,65 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 import click
 
 from . import storage as S
+from .export import _locked, _publish
 
 DECAY_TIME = (4, 15)
 EXPORT_TIME = (4, 30)
 EXPORT_WEEKDAY = 0  # Sunday (launchd: 0=Sunday; cron: 0=Sunday; schtasks: SUN)
 
-_LAUNCHD_LABELS = {"decay": "com.skillmem.decay", "export": "com.skillmem.export"}
-_WIN_TASKS = {"decay": r"SkillMem\Decay", "export": r"SkillMem\Export"}
 _CRON_MARK = "# skillmem:"
-_SYSTEMD_UNITS = {"decay": "skillmem-decay", "export": "skillmem-export"}
+
+
+def _database_tag() -> str:
+    """What makes a job name this database's (INV-12): nothing for the default
+    database, else a digest of its path. With fixed names, installing for a
+    second database replaced the first one's jobs, and its backup stopped."""
+    db = S.file_path(S.default_db_path())
+    if db == S.file_path(Path(S.user_data_dir(S.APP_NAME, appauthor=False)) / "memory.db"):
+        return ""
+    return "-" + hashlib.sha256(str(db).encode("utf-8")).hexdigest()[:8]
+
+
+def _job_names(name: Callable[[str], str]) -> dict[str, str]:
+    """Each job's name in one backend, this database's (``_database_tag``)."""
+    return {n: name(n) + _database_tag() for n in ("decay", "export")}
+
+
+def _launchd_labels() -> dict[str, str]:
+    return _job_names(lambda n: f"com.skillmem.{n}")
+
+
+def _win_tasks() -> dict[str, str]:
+    return _job_names(lambda n: f"SkillMem\\{n.title()}")
+
+
+def _cron_marks() -> dict[str, str]:
+    return _job_names(lambda n: f"{_CRON_MARK}{n}")
+
+
+def _systemd_units() -> dict[str, str]:
+    return _job_names(lambda n: f"skillmem-{n}")
 
 
 def _skillmem_bin() -> Path:
     """The skillmem binary next to the current interpreter (venv-safe)."""
     exe = "skillmem.exe" if sys.platform == "win32" else "skillmem"
-    return Path(sys.executable).parent / exe
+    here = Path(sys.executable).parent / exe
+    # `pip install --user` puts the script in ~/.local/bin, not next to python
+    found = here if here.exists() or sys.platform == "win32" else shutil.which("skillmem")
+    return Path(found) if found else here
 
 
 def _jobs() -> dict[str, list[str]]:
     bin_ = str(_skillmem_bin())
-    vault = str(S.default_data_dir() / "backups" / "vault")
+    # its own directory too: a second database's export into the first one's
+    # was refused every week (INV-12)
+    vault = str(S.default_data_dir() / "backups" / f"vault{_database_tag()}")
     return {
         "decay": [bin_, "decay", "--days", "14"],
         "export": [bin_, "export-all", vault],
@@ -55,14 +95,11 @@ def _jobs() -> dict[str, list[str]]:
 
 
 def _job_env() -> dict[str, str]:
-    """The data-dir/database overrides the install ran under.
-
-    A job scheduled from a shell with SKILLMEM_HOME or SKILLMEM_DB set used to
-    run without them at 04:15 — maintaining a different database than the one
-    the user meant. Persist exactly those two; never the whole environment.
-    """
-    return {k: v for k, v in os.environ.items()
-            if k in ("SKILLMEM_HOME", "SKILLMEM_DB") and v}
+    """The data-dir/database overrides the install ran under, so a job
+    maintains the database meant: exactly those two, never the environment,
+    absolute (a job runs from another working directory)."""
+    paths = {"SKILLMEM_HOME": S.default_data_dir, "SKILLMEM_DB": S.default_db_path}
+    return {k: str(path()) for k, path in paths.items() if os.environ.get(k)}
 
 
 def _log_dir() -> Path:
@@ -82,7 +119,7 @@ def _launchd_plist_path(label: str) -> Path:
 def _launchd_install() -> list[str]:
     done = []
     for name, argv in _jobs().items():
-        label = _LAUNCHD_LABELS[name]
+        label = _launchd_labels()[name]
         cal: dict[str, int] = {
             "Hour": (DECAY_TIME if name == "decay" else EXPORT_TIME)[0],
             "Minute": (DECAY_TIME if name == "decay" else EXPORT_TIME)[1],
@@ -101,7 +138,7 @@ def _launchd_install() -> list[str]:
             plist["EnvironmentVariables"] = _job_env()
         path = _launchd_plist_path(label)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(plistlib.dumps(plist))
+        _publish(path, plistlib.dumps(plist))
         # unload may legitimately fail (nothing loaded yet); load may not
         subprocess.run(["launchctl", "unload", str(path)], capture_output=True)
         proc = subprocess.run(["launchctl", "load", str(path)],
@@ -117,7 +154,7 @@ def _launchd_install() -> list[str]:
 
 def _launchd_remove() -> list[str]:
     done = []
-    for label in _LAUNCHD_LABELS.values():
+    for label in _launchd_labels().values():
         path = _launchd_plist_path(label)
         if path.exists():
             proc = subprocess.run(["launchctl", "unload", str(path)],
@@ -135,7 +172,7 @@ def _launchd_remove() -> list[str]:
 
 def _launchd_status() -> list[str]:
     out = []
-    for label in _LAUNCHD_LABELS.values():
+    for label in _launchd_labels().values():
         path = _launchd_plist_path(label)
         loaded = subprocess.run(
             ["launchctl", "list", label], capture_output=True
@@ -149,13 +186,8 @@ def _launchd_status() -> list[str]:
 # --------------------------------------------------------------------------- #
 
 def _win_tr(argv: list[str], env: dict[str, str] | None = None) -> str:
-    """Command string for /TR: paths with spaces go in inner quotes.
-
-    schtasks has no environment block, so the overrides the install ran under
-    (see ``_job_env``) are set inside a ``cmd /c`` wrapper — without it a
-    Windows ``--db`` user's nightly decay ran against the default database
-    while launchd/cron/systemd carried the variables.
-    """
+    """Command string for /TR: paths with spaces go in inner quotes. schtasks
+    has no environment block, so ``_job_env`` is set inside a ``cmd /c`` wrapper."""
     if not env:
         return " ".join(f'"{a}"' if " " in a else a for a in argv)
     # inside the wrapper every token is quoted: cmd.exe reads a bare & as a
@@ -180,7 +212,7 @@ def _schtasks_install() -> list[str]:
                    "/ST", f"{EXPORT_TIME[0]:02d}:{EXPORT_TIME[1]:02d}"],
     }
     for name, argv in jobs.items():
-        task = _WIN_TASKS[name]
+        task = _win_tasks()[name]
         cmd = ["schtasks", "/Create", "/F", "/TN", task, "/TR", _win_tr(argv, _job_env()), *specs[name]]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -193,7 +225,7 @@ def _schtasks_install() -> list[str]:
 
 def _schtasks_remove() -> list[str]:
     done = []
-    for task in _WIN_TASKS.values():
+    for task in _win_tasks().values():
         proc = subprocess.run(
             ["schtasks", "/Delete", "/F", "/TN", task], capture_output=True, text=True
         )
@@ -204,7 +236,7 @@ def _schtasks_remove() -> list[str]:
 
 def _schtasks_status() -> list[str]:
     out = []
-    for task in _WIN_TASKS.values():
+    for task in _win_tasks().values():
         exists = subprocess.run(
             ["schtasks", "/Query", "/TN", task], capture_output=True
         ).returncode == 0
@@ -219,10 +251,7 @@ def _schtasks_status() -> list[str]:
 def _cron_read() -> list[str]:
     try:
         proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    except FileNotFoundError:
-        # No crontab binary at all (containers, systemd-only minimal distros):
-        # an empty crontab, not a traceback. Install still fails loudly via
-        # _cron_write / backend selection.
+    except FileNotFoundError:     # no crontab binary: empty; _cron_write fails loudly
         return []
     return proc.stdout.splitlines() if proc.returncode == 0 else []
 
@@ -244,32 +273,52 @@ def _cron_write(lines: list[str]) -> None:
 def _cron_install() -> list[str]:
     jobs = _jobs()
 
-    def q(argv: list[str]) -> str:
-        return " ".join(f'"{a}"' if " " in a else a for a in argv)
+    # every token shell-quoted, the log path too, then `%`, which cron turns
+    # into a newline even inside quotes
+    def cmd(argv: list[str], log: str) -> str:
+        env = "".join(f"{k}={shlex.quote(v)} " for k, v in _job_env().items())
+        line = f"{env}{shlex.join(argv)} >> {shlex.quote(str(_log_dir() / log))} 2>&1"
+        return line.replace("%", r"\%")
 
-    env = "".join(f"{k}={shlex.quote(v)} " for k, v in _job_env().items())
+    marks = _cron_marks()
     entries = [
-        f"{DECAY_TIME[1]} {DECAY_TIME[0]} * * * {env}{q(jobs['decay'])} "
-        f">> {_log_dir() / 'decay.log'} 2>&1 {_CRON_MARK}decay",
-        f"{EXPORT_TIME[1]} {EXPORT_TIME[0]} * * {EXPORT_WEEKDAY} {env}{q(jobs['export'])} "
-        f">> {_log_dir() / 'export.log'} 2>&1 {_CRON_MARK}export",
+        f"{DECAY_TIME[1]} {DECAY_TIME[0]} * * * {cmd(jobs['decay'], 'decay.log')} "
+        f"{marks['decay']}",
+        f"{EXPORT_TIME[1]} {EXPORT_TIME[0]} * * {EXPORT_WEEKDAY} "
+        f"{cmd(jobs['export'], 'export.log')} {marks['export']}",
     ]
-    kept = [l for l in _cron_read() if _CRON_MARK not in l]
-    _cron_write(kept + entries)
+    _cron_update(entries)
     return entries
 
 
+def _cron_ours(line: str) -> bool:
+    """A line of this database's jobs; another database's are not ours."""
+    return any(line.rstrip().endswith(" " + m) for m in _cron_marks().values())
+
+
+def _cron_update(entries: list[str]) -> int:
+    """Replace this database's jobs under one user-wide read/write lock.
+
+    The crontab is shared even across SKILLMEM_HOME overrides. Keep the lock
+    in the user's home, never unlink it, and hold it until crontab exits.
+    External crontab editors do not participate in this advisory lock.
+    """
+    with _locked(Path.home(), lock_name=".skillmem-cron.lock"):
+        current = _cron_read()
+        kept = [line for line in current if not _cron_ours(line)]
+        removed = len(current) - len(kept)
+        if entries or removed:
+            _cron_write(kept + entries)
+        return removed
+
+
 def _cron_remove() -> list[str]:
-    current = _cron_read()
-    kept = [l for l in current if _CRON_MARK not in l]
-    if len(kept) != len(current):
-        _cron_write(kept)
-        return [f"removed {len(current) - len(kept)} cron entries"]
-    return []
+    removed = _cron_update([])
+    return [f"removed {removed} cron entries"] if removed else []
 
 
 def _cron_status() -> list[str]:
-    ours = [l for l in _cron_read() if _CRON_MARK in l]
+    ours = [l for l in _cron_read() if _cron_ours(l)]
     return ours or ["no skillmem cron entries"]
 
 
@@ -308,15 +357,23 @@ def _systemd_unit_texts(name: str, argv: list[str]) -> tuple[str, str]:
         "decay": "skillmem decay (daily memory maintenance)",
         "export": "skillmem export (weekly vault backup)",
     }[name]
-    log = _log_dir() / f"{name}.log"
+    # `%` is a unit specifier and `$` expands in ExecStart; a value in
+    # Environment= is only unquoted when the quote wraps the whole assignment.
+    def spec(v: str) -> str:
+        return v.replace("%", "%%")
+
+    def env(k: str, v: str) -> str:
+        return '"' + spec(f"{k}={v}").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    log = spec(str(_log_dir() / f"{name}.log"))
     service = (
         "[Unit]\n"
         f"Description={descr}\n"
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        + "".join(f"Environment={k}={shlex.quote(v)}\n" for k, v in _job_env().items())
-        + f"ExecStart={shlex.join(argv)}\n"
+        + "".join(f"Environment={env(k, v)}\n" for k, v in _job_env().items())
+        + f"ExecStart={spec(shlex.join(argv)).replace('$', '$$')}\n"
         f"StandardOutput=append:{log}\n"
         f"StandardError=append:{log}\n"
     )
@@ -342,22 +399,21 @@ def _systemd_install() -> list[str]:
     unit_dir = _systemd_unit_dir()
     unit_dir.mkdir(parents=True, exist_ok=True)
     done = []
-    # A box first scheduled over SSH (no user bus → cron) and re-installed
-    # from a desktop session would otherwise run decay twice a night.
+    # an earlier install over SSH (no user bus) went to cron: not twice a night
     if shutil.which("crontab"):
         done += _cron_remove()
     for name, argv in _jobs().items():
-        unit = _SYSTEMD_UNITS[name]
+        unit = _systemd_units()[name]
         service, timer = _systemd_unit_texts(name, argv)
-        (unit_dir / f"{unit}.service").write_text(service, encoding="utf-8")
-        (unit_dir / f"{unit}.timer").write_text(timer, encoding="utf-8")
+        _publish(unit_dir / f"{unit}.service", service.encode("utf-8"))
+        _publish(unit_dir / f"{unit}.timer", timer.encode("utf-8"))
     proc = _systemd_run("daemon-reload")
     if proc.returncode != 0:
         raise click.ClickException(
             f"systemctl --user daemon-reload failed: {proc.stderr.strip()}"
         )
     for name in _jobs():
-        unit = _SYSTEMD_UNITS[name]
+        unit = _systemd_units()[name]
         proc = _systemd_run("enable", "--now", f"{unit}.timer")
         if proc.returncode != 0:
             raise click.ClickException(
@@ -371,7 +427,7 @@ def _systemd_remove() -> list[str]:
     unit_dir = _systemd_unit_dir()
     done = []
     reload_needed = False
-    for unit in _SYSTEMD_UNITS.values():
+    for unit in _systemd_units().values():
         _systemd_run("disable", "--now", f"{unit}.timer")  # best-effort
         removed_any = False
         for suffix in (".timer", ".service"):
@@ -390,7 +446,7 @@ def _systemd_remove() -> list[str]:
 def _systemd_status() -> list[str]:
     unit_dir = _systemd_unit_dir()
     out = []
-    for unit in _SYSTEMD_UNITS.values():
+    for unit in _systemd_units().values():
         present = (unit_dir / f"{unit}.timer").exists()
         active = _systemd_run("is-active", f"{unit}.timer").returncode == 0
         out.append(

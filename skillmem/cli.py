@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -14,26 +15,47 @@ import click
 
 from . import storage as S
 from .export import export_all
-from .migrate import DEFAULT_SOURCE_DIR, discover_claude_memory_dirs, import_dir
+from .migrate import discover_claude_memory_dirs, import_dirs
 from .vault import import_vault
+from .hooks import HookCommand, renders_as_nothing
 
 
-def _owner_trust() -> tuple[int | None, str | None]:
-    """A person at a terminal approving their own write — the one honest signal.
+def _write_secret(path: Path, text: str) -> None:
+    """Replace ``path`` with a file only its owner can read.
 
-    An agent can call the CLI through Bash as easily as a human can type it, so
-    the TTY is what separates them: an agent's subprocess has none. Written by an
-    agent, a memory arrives as data until the owner approves it.
+    A fresh 0600 file renamed over the old one: rewriting in place kept an
+    existing 0644 mode (O_CREAT's mode applies to new files only), and a
+    failed write left the old file truncated or, worse, deleted.
     """
-    import time as _t
-    if sys.stdin.isatty() or sys.stdout.isatty():
-        return int(_t.time()), "cli-tty"
-    return None, None
+    import tempfile
+    path = Path(os.path.realpath(path))   # a symlink stays one; its target is replaced
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def _conn(db_path: Path | None):
-    conn = S.connect(db_path)
-    S.init_schema(conn)
+    try:
+        conn = S.connect(db_path)
+        # closed with the command, not when collected: a caller in this process
+        # (CliRunner, a traceback it keeps) held the file open, and Windows
+        # cannot delete or replace an open file (WinError 32)
+        ctx = click.get_current_context(silent=True)
+        if ctx is not None:
+            ctx.call_on_close(conn.close)
+        S.init_schema(conn)
+    except (sqlite3.Error, OSError, RuntimeError) as exc:   # a directory, a corrupt
+        # file, a parent that cannot be made, a symlink loop, an unknown ~user:
+        # a message, not a traceback (and not default_db_path() again, which
+        # raises again on an unknown ~user in the variable)
+        where = (db_path or os.environ.get("SKILLMEM_DB")
+                 or os.environ.get("SKILLMEM_HOME") or S.default_db_path())
+        raise click.ClickException(f"cannot open {where}: {exc}")
     return conn
 
 
@@ -45,53 +67,76 @@ from . import __version__
 @click.option(
     "--db",
     "db_path",
-    type=click.Path(dir_okay=False, path_type=Path),
+    # no check at all (click.Path checks readability by default): the group
+    # parses it before a hook's fail-open guard runs; opening reports it
+    type=click.Path(path_type=Path, readable=False),
     default=None,
-    help=f"Path to SQLite DB (default: {S.default_db_path()})",
+    help="Path to SQLite DB (default: SKILLMEM_DB or the skillmem data directory)",
 )
 @click.pass_context
 def main(ctx: click.Context, db_path: Path | None) -> None:
     ctx.ensure_object(dict)
     ctx.obj["db_path"] = db_path
     if db_path is not None and str(db_path) != ":memory:":
-        db_path = db_path.expanduser().resolve()   # a relative --db must not land in a plist
+        try:   # a relative --db must not land in a plist
+            db_path = S.file_path(db_path.expanduser())
+        except (OSError, RuntimeError):
+            # a symlink loop, a vanished cwd, an unknown ~user: this runs
+            # before a hook's fail-open guard, so the path is left as given
+            # and opening the database reports it instead
+            pass
         ctx.obj["db_path"] = db_path
         # so scheduled jobs (schedule._job_env) and anything reading
         # default_db_path() in this process see the same database
         os.environ["SKILLMEM_DB"] = str(db_path)
 
 
-# NOTE: a second `init` command is defined further down (the installer that
-# also wires up Claude Code). Click registers by name, so the later definition
-# silently replaced this one — it was dead code and has been removed. Use
-# `skillmem doctor` for the "create DB + print stats" behaviour it had.
-
-
 @main.command()
 @click.option(
     "--source",
     type=click.Path(file_okay=False, exists=True, path_type=Path),
-    default=DEFAULT_SOURCE_DIR,
-    help="Source directory with .md memories.",
+    envvar="SKILLMEM_SOURCE_DIR",
+    default=None,
+    help="Source directory with .md memories (default: every "
+         "~/.claude/projects/*/memory, as init finds them).",
 )
 @click.pass_context
-def migrate(ctx: click.Context, source: Path) -> None:
+def migrate(ctx: click.Context, source: Path | None) -> None:
     """Import .md memories from Claude Code auto-memory."""
     conn = _conn(ctx.obj["db_path"])
-    report = import_dir(conn, source)
+    if source is None and not S.owner_present():
+        # a pre-0.11 `Stop → skillmem migrate` hook would import every
+        # project's memory each turn
+        raise click.ClickException("no --source and no terminal: nothing imported "
+                                   "(re-run `skillmem init` to drop the old Stop hook)")
+    sources = [source] if source else discover_claude_memory_dirs()
+    if not sources:
+        click.echo("no ~/.claude/projects/*/memory directories found; pass --source")
+    failed = [_echo_import(report, f"{src}: ") for src, report in import_dirs(conn, sources)]
+    if any(failed):
+        sys.exit(1)
+
+
+def _echo_import(report: Any, prefix: str = "") -> bool:
+    """An importer's counts, and its failures on stderr. True when a file
+    failed: the command then exits 1, as any other write that did not
+    happen does (INV-08)."""
     click.echo(
-        f"inserted={report.inserted} updated={report.updated} "
+        f"{prefix}inserted={report.inserted} updated={report.updated} "
         f"skipped={report.skipped} failed={len(report.failed)}"
     )
-    for name, err in report.failed:
+    for name, err in report.failed[:5]:
         click.echo(f"  ! {name}: {err}", err=True)
+    if len(report.failed) > 5:
+        click.echo(f"  ... and {len(report.failed) - 5} more failures", err=True)
+    return bool(report.failed)
 
 
 @main.command()
 @click.argument("query")
 @click.option("--kind", default=None, help="Filter by kind (feedback/project/...)")
 @click.option("--project", default=None)
-@click.option("--limit", default=10, show_default=True)
+@click.option("--limit", default=10, show_default=True, type=click.IntRange(min=1))
 @click.option("--notes/--no-notes", "with_notes", default=False,
               help="Include session recaps. Hidden by default: they outnumber "
                    "everything else and crowd skills out of the top results.")
@@ -110,14 +155,14 @@ def search(
     """Full-text search via FTS5 BM25."""
     conn = _conn(ctx.obj["db_path"])
     excluded = kind is None and not with_notes
-    # Session recaps accumulate one per session and can be 90% of the words in
-    # the database. They are excluded inside the ranking query, not afterwards:
-    # the candidate pool is capped, so a wall of recaps would fill it and hide
-    # every skill that matched.
+    # recaps are excluded inside the ranking: after it, they could fill the pool
     hits = S.search(conn, query, kind=kind, project=project, limit=limit,
                     exclude_kinds=("note",) if excluded else ())
+    from .hooks import frame_for_model
     if fmt == "json":
-        click.echo(json.dumps(hits, ensure_ascii=False, default=str))
+        # unapproved hits travel inside the frame, JSON or text
+        click.echo(json.dumps([frame_for_model(h, h) for h in hits],
+                              ensure_ascii=False, default=str))
         return
     if not hits:
         click.echo("(no results)" + (" — session recaps excluded, --notes to "
@@ -126,15 +171,20 @@ def search(
     if excluded:
         click.echo("(session recaps excluded; --notes to include)")
     for h in hits:
-        snippet = (h.get("snippet") or "").replace("\n", " ")
+        shown = frame_for_model(h, {"title": h["title"], "snippet": h.get("snippet") or ""},
+                                fields=("snippet",))
         rank = h.get("rank")
         origin = h.get("origin") or "unknown"
-        mark = "" if h.get("trusted_at") else "  [unapproved]"
+        mark = "" if shown["trusted"] else "  [unapproved]"
         click.echo(f"[{h['kind']:<9}] {h['slug']}  (rank={rank:.2f}) "
                    f"origin={origin}{mark}")
-        click.echo(f"    {h['title']}")
-        if snippet:
-            click.echo(f"    … {snippet} …")
+        click.echo(f"    {shown['title']}")
+        if not shown["trusted"]:
+            # a framed snippet must keep its lines, or the frame is decapitated
+            for line in shown["snippet"].split("\n"):
+                click.echo(f"    {line}")
+        elif shown["snippet"]:
+            click.echo(f"    … {shown['snippet'].replace(chr(10), ' ')} …")
 
 
 @main.command()
@@ -145,16 +195,21 @@ def search(
 def cat(ctx: click.Context, slug: str, history: bool, links: bool) -> None:
     """Show one memory by slug."""
     conn = _conn(ctx.obj["db_path"])
-    item = S.get(conn, slug)
-    if not item:
+    record = S.read_record(conn, slug, with_history=history)
+    if not record:
         click.echo(f"not found: {slug}", err=True)
         sys.exit(1)
-    click.echo(f"# {item.title}")
+    from .hooks import frame_for_model, frame_history
+    item = record["item"]
+    shown = frame_for_model(item, {"title": item.title, "body": record["body"],
+                                   "links_out": record["links_out"]})
+    click.echo(f"# {shown['title']}")
     click.echo(
         f"slug={item.slug} kind={item.kind} "
         f"project={item.project or '-'} agent={item.agent or '-'}"
     )
-    click.echo(f"created={item.created_at} updated={item.updated_at}")
+    click.echo(f"created={item.created_at} updated={item.updated_at} "
+               f"lifecycle={item.lifecycle} pinned={int(bool(item.pinned))}")
     click.echo(f"origin={item.origin} "
                + (f"trusted_at={item.trusted_at} by={item.trusted_by}"
                   if item.trusted_at else
@@ -164,41 +219,44 @@ def cat(ctx: click.Context, slug: str, history: bool, links: bool) -> None:
     if item.body_path:
         click.echo(f"body_path={item.body_path}")
     click.echo("")
-    body = S.load_body(item)
-    if item.trusted_at is None:
-        from .hooks import render_untrusted
-        body = render_untrusted(body)
-    click.echo(body)
+    click.echo(shown["body"])
     if links:
         click.echo("")
         click.echo("-- links out --")
-        for s in S.links_from(conn, slug):
-            click.echo(f"  → {s}")
+        if isinstance(shown["links_out"], str):
+            click.echo(shown["links_out"])   # framed: an unapproved body's words
+        else:
+            for s in shown["links_out"]:
+                click.echo(f"  → {s}")
         click.echo("-- links in --")
-        for s in S.links_to(conn, slug):
-            click.echo(f"  ← {s}")
+        for row in record["links_in"]:
+            click.echo(f"  ← {row.slug}")
     if history:
         click.echo("")
         click.echo("-- history --")
-        for h in S.history(conn, slug):
-            click.echo(
-                f"  {h['changed_at']}  by={h.get('changed_by') or '-'}  "
-                f"reason={h.get('reason') or '-'}"
-            )
+        for h in record["history"]:
+            shown_h = frame_history(h)
+            click.echo(f"  {h['changed_at']}  by=" + ("" if h.get("changed_by") else "-"))
+            for field in ("changed_by", "reason"):
+                if h.get(field):
+                    click.echo(shown_h[field])
 
 
 @main.command(name="ls")
 @click.option("--kind", default=None)
 @click.option("--project", default=None)
-@click.option("--limit", default=50, show_default=True)
+@click.option("--limit", default=50, show_default=True, type=click.IntRange(min=1))
 @click.pass_context
 def ls_cmd(ctx: click.Context, kind: str | None, project: str | None, limit: int) -> None:
     """List recent memories."""
     conn = _conn(ctx.obj["db_path"])
     items = S.list_items(conn, kind=kind, project=project, limit=limit)
+    from .hooks import frame_title
     for it in items:
         mark = "" if it.trusted_at else " [unapproved]"
-        click.echo(f"[{it.kind:<9}] {it.slug}  origin={it.origin}{mark} — {it.title}")
+        title = frame_title(it)
+        click.echo(f"[{it.kind:<9}] {it.slug}  origin={it.origin}{mark} — "
+                   + (title if it.trusted_at else "\n" + title))
 
 
 @main.command()
@@ -235,37 +293,42 @@ def write(
 ) -> None:
     """Insert or update a memory."""
     conn = _conn(ctx.obj["db_path"])
+    # bytes, decoded: text mode would store CRLF as LF (INV-08)
     if body_file:
-        body_text = body_file.read_text(encoding="utf-8")
+        body_text = body_file.read_bytes().decode("utf-8")
     elif body is not None:
         body_text = body
     else:
-        body_text = sys.stdin.read()
+        body_text = sys.stdin.buffer.read().decode("utf-8")
 
-    trusted_at, trusted_by = _owner_trust()
     item = S.MemoryItem(
         slug=slug, kind=kind, title=title, body=body_text,
         project=project, agent=agent, ttl_days=ttl_days,
-        # Provenance follows the channel: a terminal means a person typed it;
-        # no terminal means an agent ran the CLI, and "owner" would be a lie.
-        origin="owner" if trusted_at else "agent",
-        trusted_at=trusted_at, trusted_by=trusted_by,
+        origin="owner" if S.owner_present() else "agent",
     )
     try:
         result = S.upsert(
-            conn, item, reason=reason, force=force,
-            # the TTY, not the module: an agent runs this command through Bash
-            # as easily as a person types it
-            owner_call=S.owner_present(),
+            conn, item, surface="cli", reason=reason, force=force,
             check_conflicts=check_conflicts,
-            links=S.extract_wikilinks(body_text),
-            explicit={p for p in ("kind", "project", "ttl_days")
+            explicit={p for p in ("kind", "project", "ttl_days", "agent")
                       if ctx.get_parameter_source(p) == click.core.ParameterSource.COMMANDLINE},
         )
-    except (S.MemoryConflict, ValueError) as exc:
+    except (S.MemoryConflict, S.SealedRecord, ValueError) as exc:
         click.echo(f"CONFLICT: {exc}", err=True)   # same prefix as learn; exit 2 is write's convention
         sys.exit(2)
     click.echo(f"OK: {result.slug} (id={result.id})")
+
+
+def _owner_only(verb: str) -> None:
+    """The one gate of the owner-only verbs (`_OWNER_DENY_RULES` lists them):
+    without a person at a terminal, refuse. An agent runs the CLI through Bash
+    as easily as a human types it. Accident protection, not a wall, and
+    neither are the deny rules `init --claude-code` installs (see there)."""
+    if not S.owner_present():
+        raise SystemExit(
+            f"refusing: `{verb}` needs a person at a terminal (no TTY). "
+            "Run it yourself, not through an agent."
+        )
 
 
 @main.command()
@@ -274,17 +337,7 @@ def write(
 @click.pass_context
 def rm(ctx: click.Context, slug: str, reason: str) -> None:
     """Soft-delete a memory (kept in memory_history)."""
-    if not S.owner_present():
-        # `rm` is one of the four owner-only verbs the deny rules list. Storage
-        # already refuses a sealed record without a terminal, but that leaves
-        # every unsealed row deletable through Bash — an agent's own notes and
-        # skills disappear silently. The wall is `init --claude-code`; this
-        # gate is the same accident-protection `skills-archive` and `trust`
-        # already carry.
-        raise SystemExit(
-            "refusing: `rm` needs a person at a terminal (no TTY). "
-            "Run it yourself, not through an agent."
-        )
+    _owner_only("rm")
     conn = _conn(ctx.obj["db_path"])
     try:
         deleted = S.soft_delete(conn, slug, reason)
@@ -300,7 +353,7 @@ def rm(ctx: click.Context, slug: str, reason: str) -> None:
         sys.exit(1)
 
 
-@main.command()
+@main.command(cls=HookCommand)
 @click.option("--types", default="user,feedback",
               help="Comma-separated kinds to inject (default: user,feedback)")
 @click.option("--budget", "budget_tokens", default=2000, show_default=True,
@@ -339,21 +392,26 @@ def inject(
         suffix = f"({brief['omitted']} omitted, budget={brief['budget_tokens']} tk)"
         lines.append(f"_… {suffix}_" if fmt == "md" else suffix)
     if brief.get("awaiting_reapproval"):
-        # Names, not text: these are the owner's own records, rewritten by an
-        # agent, and their current words are unapproved like any other.
-        slugs = ", ".join(brief["awaiting_reapproval"])
+        slugs = ", ".join(brief["awaiting_reapproval"])   # names, never unapproved text
         note = (f"YOUR OWN rules, rewritten since you approved them, are NOT shown: "
                 f"{slugs} — review with `skillmem cat <slug>`, then "
                 f"`skillmem trust <slug>`")
         lines.append(f"_{note}_" if fmt == "md" else note)
-    if brief.get("unapproved"):
-        # Said as a count, never as content: the briefing is title-only, and an
-        # unapproved title belongs behind a frame, which this format has no room
-        # for. `skillmem search --notes` and `skillmem trust <slug>` are the way in.
+    if brief.get("unapproved"):     # a count: an unapproved title needs a frame
         note = (f"{brief['unapproved']} unapproved memories are NOT shown here "
                 "(data, not rules — approve with `skillmem trust <slug>`)")
         lines.append(f"_{note}_" if fmt == "md" else note)
     click.echo("\n".join(lines))
+
+
+def _as_seen(text: str, keep: str = "") -> str:
+    """Text as the owner is asked to approve it: every character a terminal
+    acts on or hides (a control, a line separator, anything that renders as
+    nothing) is shown as its escape (INV-01)."""
+    import unicodedata
+    return "".join(ch if ch in keep or not (unicodedata.category(ch) in ("Cc", "Zl", "Zp")
+                                            or renders_as_nothing(ch))
+                   else ch.encode("unicode_escape").decode("ascii") for ch in text)
 
 
 @main.command("trust")
@@ -367,50 +425,31 @@ def trust_cmd(ctx: click.Context, slug: str, untrust: bool) -> None:
     document it was reading, so what an agent wrote arrives unapproved — as data.
     Editing an approved memory's text drops the approval with it.
     """
-    # The same signal write/learn use: no terminal, no owner. An agent that is
-    # talked into `skillmem trust <slug>` from Bash must get a refusal, not an
-    # approval — otherwise one command undoes the whole trust boundary. This is
-    # accident protection, not a wall: `init --claude-code` also installs a
-    # permission deny rule for the command, and README says so.
-    if _owner_trust()[0] is None:
-        # both directions: an injected `--untrust` would strip a real rule
-        raise click.ClickException(
-            "refusing: `trust` needs a person at a terminal (no TTY). "
-            "Run it yourself, not through an agent."
-        )
+    _owner_only("trust")    # both directions: an injected `--untrust` strips a rule
     conn = _conn(ctx.obj["db_path"])
-    # Pin the approval to the text this terminal just saw: an agent rewrite
-    # landing between the read and the approval would otherwise become approved
-    # text, and the hooks would inject the agent's version as the owner's rule.
+    # the approval is pinned to the text and kind this terminal shows (set_trust)
     seen = S.get(conn, slug)
     if seen is None:
         raise click.ClickException(f"no memory with slug '{slug}'")
     if not untrust:
-        # Show it. The pin is worth nothing if the owner approves a slug without
-        # seeing the words: an agent rewrite between a separate `cat` and this
-        # command was approved text.
         shown = S.load_body(seen)
-        if seen.body_path and (shown != S.read_body_file(seen.body_path)
-                               or S.mismatched_bodies(conn) and seen.slug in
-                               S.mismatched_bodies(conn)):
-            # load_body falls back to the stored excerpt when the file is missing
-            # or does not match the approved hash — approving on the strength of
-            # an excerpt approves text this terminal never displayed.
+        if S.is_excerpt(seen, shown):     # never approve text this terminal did not show
             raise click.ClickException(
                 f"'{slug}' keeps its text in a file that is missing or does not "
                 f"match what was approved, so only an excerpt can be shown. "
                 f"Fix the record first (`skillmem verify`); refusing to approve "
                 f"text you have not seen."
             )
-        click.echo(f"--- {seen.slug} [{seen.kind}] ---")
-        click.echo(seen.title)
+        click.echo(f"--- {_as_seen(seen.slug)} [{_as_seen(seen.kind)}] ---")
+        click.echo(_as_seen(seen.title))
         click.echo("")
-        click.echo(shown)
+        click.echo(_as_seen(shown, keep="\n\t"))
         click.echo("--- end ---")
         click.confirm("Approve this text as your own rule?", abort=True)
     try:
         item = S.set_trust(conn, slug, trusted=not untrust,
-                           expect_hash=None if untrust else seen.content_hash)
+                           expect_hash=None if untrust else seen.content_hash,
+                           expect_kind=None if untrust else seen.kind)
     except S.MemoryConflict as exc:
         raise click.ClickException(str(exc))
     conn.commit()
@@ -418,7 +457,7 @@ def trust_cmd(ctx: click.Context, slug: str, untrust: bool) -> None:
         raise click.ClickException(f"no memory with slug '{slug}'")
     state = ("untrusted" if untrust else
              f"trusted at {item.trusted_at} by {item.trusted_by}")
-    click.echo(f"{slug}: origin={item.origin}, {state}")
+    click.echo(f"{_as_seen(slug)}: origin={item.origin}, {state}")
 
 
 @main.command("recap")
@@ -445,8 +484,11 @@ def recap_cmd(transcript: Path | None, force: bool) -> None:
         "hook_event_name": "Manual",
         "force": force,
     }
-    run_recap(data)
-    click.echo(f"recap run for {path.name} (see `skillmem hooks-status`)")
+    problem = run_recap(data)
+    if problem:
+        raise click.ClickException(f"no recap written for {path.name}: {problem} "
+                                   f"(see `skillmem hooks-status`)")
+    click.echo(f"recap written for {path.name}")
 
 
 @main.command("reindex-lexical")
@@ -533,7 +575,10 @@ def hooks_status(lines: int, fmt: str) -> None:
 def export_all_cmd(ctx: click.Context, destination: Path) -> None:
     """Dump every memory back to .md with frontmatter."""
     conn = _conn(ctx.obj["db_path"])
-    n = export_all(conn, destination)
+    try:
+        n = export_all(conn, destination)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
     click.echo(f"OK: exported {n} memories to {destination}")
 
 
@@ -555,18 +600,8 @@ def import_vault_cmd(
     skip_frontmatter_memories: bool,
 ) -> None:
     """Import an Obsidian vault (recursive)."""
-    if not S.owner_present():
-        # `import-vault` is one of the four owner-only verbs. Without a terminal
-        # a forged .md file with `metadata.node_type: memory` can revive an
-        # owner-deleted sealed slug with replacement text — the seal survives,
-        # so search and briefing pick up the agent's version as an approved
-        # rule. `_run_import` calls `upsert(..., revive=True, owner_call=...)`
-        # and the storage guard alone did not cover the tombstoned-then-revived
-        # path. Wall stays `init --claude-code`; this is accident-protection.
-        raise SystemExit(
-            "refusing: `import-vault` needs a person at a terminal (no TTY). "
-            "Run it yourself, not through an agent."
-        )
+    # a dump restores what only the owner may: a deleted slug, a seal, an archive
+    _owner_only("import-vault")
     conn = _conn(ctx.obj["db_path"])
     report = import_vault(
         conn, path,
@@ -574,14 +609,8 @@ def import_vault_cmd(
         project_override=project,
         skip_auto_memories=skip_frontmatter_memories,
     )
-    click.echo(
-        f"inserted={report.inserted} updated={report.updated} "
-        f"skipped={report.skipped} failed={len(report.failed)}"
-    )
-    for name, err in report.failed[:5]:
-        click.echo(f"  ! {name}: {err}", err=True)
-    if len(report.failed) > 5:
-        click.echo(f"  ... and {len(report.failed) - 5} more failures", err=True)
+    if _echo_import(report):
+        sys.exit(1)
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -589,31 +618,14 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-
-# Every command that only the owner may run. The TTY check inside each one is
-# accident protection — a pseudo-terminal is one pty.openpty() away — so the deny
-# rules are what actually stop an agent. `trust` alone was listed, while
-# `skills-archive`, `rm` and `import-vault` reached the same outcomes.
-#
-# Prefix rules alone are not the wall either: `script -qec 'skillmem trust x'
-# /dev/null` used to slip past because Claude Code sees the command as
-# `script...`, not `skillmem...`. Any pty-providing wrapper (script, unbuffer,
-# expect, socat, a python one-liner spawning through pty) then reached the
-# same commands. Match the sensitive verb wherever it lands in the command line.
-#
-# The `*skillmem trust*` glob needs a literal space between "skillmem" and the
-# verb, so `python -m skillmem.cli trust x` (a supported entry point) slipped
-# past too — the substring is "skillmem.cli trust", not "skillmem trust". The
-# `.cli` rules below catch that path.
-#
-# The verb itself can also be hidden behind shell substitution:
-# `V=trust script -qec 'skillmem $V foo' /dev/null` runs `skillmem trust foo`
-# after the shell rewrites `$V`, but Claude Code's fnmatch sees the literal
-# command line — no `skillmem trust` substring anywhere — and the round-13
-# evidence walked exactly that path. An agent calling skillmem from Bash has
-# no reason to construct the verb through `$`, `${…}`, `$(…)`, or backticks,
-# so any of those next to `skillmem` is denied outright. MCP tools remain the
-# supported surface for reads and writes; those do not go through Bash.
+# Every command that only the owner may run. The TTY check inside each one
+# (_owner_only) is accident protection, and so are these rules: they match the
+# command line as written, before the shell rewrites it (`sk''illmem tr''ust x`
+# under `script` matches none). They stop the literal forms an injected
+# document names: the verb anywhere after `skillmem` (a pty wrapper, a global
+# option, `python -m skillmem.cli`), and any shell substitution or `eval` next
+# to `skillmem`, which could hide the verb. MCP tools are the supported
+# surface for reads and writes; those do not go through Bash.
 _OWNER_DENY_RULES = (
     "Bash(skillmem trust*)",
     "Bash(skillmem skills-archive*)",
@@ -627,9 +639,15 @@ _OWNER_DENY_RULES = (
     "Bash(*skillmem.cli skills-archive*)",
     "Bash(*skillmem.cli rm*)",
     "Bash(*skillmem.cli import-vault*)",
-    # Shell substitution before or after `skillmem` — variable expansion
-    # (`$V`, `${V}`), command substitution (`$(…)`, backticks), and `eval`
-    # are the hooks that hide the verb from the literal-substring rules.
+    # `rm` needs its spaces: it is too short to stand alone
+    "Bash(*skillmem*trust*)",
+    "Bash(*skillmem*skills-archive*)",
+    "Bash(*skillmem*import-vault*)",
+    # the other direction of skills-archive (0.12.0); `skills rm` is " rm "
+    "Bash(*skillmem*skills-restore*)",
+    "Bash(*skillmem*--purge-db*)",
+    "Bash(*skillmem* rm *)",
+    "Bash(*skillmem*--db*)",
     "Bash(*skillmem*$*)",
     "Bash(*$*skillmem*)",
     "Bash(*skillmem*`*)",
@@ -637,7 +655,6 @@ _OWNER_DENY_RULES = (
     "Bash(*eval*skillmem*)",
     "Bash(*skillmem*eval*)",
 )
-_TRUST_DENY_RULE = _OWNER_DENY_RULES[0]   # kept: older settings carry this one
 
 
 def _fresh(path: Path) -> Path:
@@ -646,11 +663,10 @@ def _fresh(path: Path) -> Path:
     by the second — the last one silently overwrote the only copy of the
     original. Exclusive create, so two inits racing cannot pick one name;
     mode 0600, because ~/.claude.json carries the OAuth account."""
-    import os as _os
     cand, n = path, 1
     while True:
         try:
-            _os.close(_os.open(cand, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o600))
+            os.close(os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
             return cand
         except FileExistsError:
             cand = path.with_name(f"{path.name}.{n}")
@@ -664,44 +680,90 @@ def _backup_file(path: Path) -> Path | None:
     import time as _time
     if not path.exists():
         return None
+    # one per file per run: the first holds the original, the rest init's own steps
+    key = path.resolve()
+    if key in _BACKED_UP:
+        return _BACKED_UP[key]
     b = _fresh(path.with_suffix(f"{path.suffix}.bak.{int(_time.time())}"))
     b.write_bytes(path.read_bytes())
+    _BACKED_UP[key] = b
     return b
 
+
+_BACKED_UP: dict[Path, Path] = {}
+
+
+class _ConfigChanged(Exception):
+    """A config file changed between a patcher's read and its write."""
+
+
+# What each config file held when the patcher now editing it started.
+_CONFIG_BASIS: dict[Path, bytes | None] = {}
+
+
+def _file_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _patches_config(fn: Any) -> Any:
+    """Run a read-modify-write of an editor's config file as compare-and-swap
+    (INV-05): ``_atomic_write_text`` refuses the write when the file is no
+    longer what it was when the patcher started, and the patcher runs again.
+    An editor holds no lock we could share, so the window left is one file
+    read, between that check and the rename.
+    """
+    import functools as _functools
+
+    @_functools.wraps(fn)
+    def run(path: Path, *args: Any, **kwargs: Any) -> Any:
+        key = path.resolve()
+        try:
+            for _ in range(5):
+                _CONFIG_BASIS[key] = _file_bytes(path)
+                try:
+                    return fn(path, *args, **kwargs)
+                except _ConfigChanged:
+                    continue
+        finally:
+            _CONFIG_BASIS.pop(key, None)
+        raise click.ClickException(f"{path} kept changing while skillmem edited it; "
+                                   f"re-run when the editor is done with it")
+    return run
+
+
+def _invalid_json(path: Path, err: str) -> dict[str, Any]:
+    """Refuse to touch a config file that does not parse; nothing is written."""
+    click.echo(f"warn: {path} contains invalid JSON ({err}); refusing to "
+               f"overwrite. Fix it and re-run init.", err=True)
+    return {"changed": False, "reason": "existing JSON is invalid"}
+
+
+def _write_config(path: Path, data: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """Back ``path`` up, write ``data`` over it, and report ``result`` with
+    the backup: only a real write earns one."""
+    backup = _backup_file(path)
+    _atomic_write_json(path, data)
+    return {**result, "backup": str(backup) if backup else None}
+
+
+@_patches_config
 def _patch_claude_json(
     claude_json: Path,
     mcp_binary: Path,
     *,
     db_env: str | None = None,
 ) -> dict[str, Any]:
-    """Add a ``mcpServers.skillmem`` entry to ~/.claude.json.
-
-    Reads → (backup only if something changes) → writes atomically. If the
-    existing JSON is corrupt, warns and refuses to touch the file — no backup,
-    nothing was written.
-    """
-    data: dict[str, Any] = {}
-    raw = ""
-    if claude_json.exists():
-        raw = claude_json.read_text(encoding="utf-8")
-        try:
-            data = json.loads(raw) if raw.strip() else {}
-        except json.JSONDecodeError as exc:
-            click.echo(
-                f"warn: {claude_json} contains invalid JSON ({exc}); refusing to "
-                f"overwrite. Fix it and re-run init.",
-                err=True,
-            )
-            return {"changed": False, "reason": "existing JSON is invalid"}
-
-    def _backup() -> Path | None:
-        return _backup_file(claude_json)
-
+    """Add a ``mcpServers.skillmem`` entry to ~/.claude.json. An existing entry
+    is kept, except the database it points at, which follows --db, and a
+    skillmem-mcp command, which follows this venv."""
+    data, err = _read_json_config(claude_json)
+    if err:
+        return _invalid_json(claude_json, err)
     servers = data.setdefault("mcpServers", {})
     if "skillmem" in servers:
-        # an existing entry is kept — except the database it points at, which
-        # must follow --db: an upgrader who re-runs init --db X used to keep
-        # the old (or no) SKILLMEM_DB forever
         entry = servers["skillmem"]
         if not isinstance(entry, dict):
             return {"changed": False, "reason": "mcpServers.skillmem is not an object; fix by hand"}
@@ -715,23 +777,18 @@ def _patch_claude_json(
         cmd = entry.get("command")
         if (isinstance(cmd, str) and cmd != str(mcp_binary) and mcp_binary.exists()
                 and Path(cmd.strip('"')).name.lower() in ("skillmem-mcp", "skillmem-mcp.exe")):
-            entry["command"] = str(mcp_binary)   # the hooks follow the venv; so must the server
+            entry["command"] = str(mcp_binary)
             added.append(f"command={mcp_binary}")
         if added:
-            backup = _backup()
-            _atomic_write_json(claude_json, data)
-            return {"changed": True, "added": "mcpServers.skillmem." + ", ".join(added),
-                    "backup": str(backup) if backup else None}
+            return _write_config(claude_json, data, {
+                "changed": True, "added": "mcpServers.skillmem." + ", ".join(added)})
         return {"changed": False, "reason": "skillmem MCP already configured"}
 
     entry: dict[str, Any] = {"command": str(mcp_binary), "args": []}
     if db_env:
         entry["env"] = {"SKILLMEM_DB": db_env}
     servers["skillmem"] = entry
-    backup = _backup()
-    _atomic_write_json(claude_json, data)
-    return {"changed": True, "added": "mcpServers.skillmem",
-            "backup": str(backup) if backup else None}
+    return _write_config(claude_json, data, {"changed": True, "added": "mcpServers.skillmem"})
 
 
 #: Editors that read the Claude-shaped ``{"mcpServers": {...}}`` map. The path
@@ -750,20 +807,16 @@ def _agent_config_path(parts: tuple[str, ...]) -> Path:
     return Path.home().joinpath(*parts)
 
 
-def _read_json_config(path: Path) -> tuple[dict[str, Any], Path | None, str | None]:
-    """Read a JSON config. Returns (data, None, error); the backup slot is
-    filled by ``_backup_file`` right before a caller writes.
-
-    A non-None error means the file is there but unparseable — callers refuse
-    to touch it, same as ``_patch_claude_json``.
-    """
+def _read_json_config(path: Path) -> tuple[dict[str, Any], str | None]:
+    """(data, error) of a JSON config; an error means the file is there but
+    does not parse, and callers refuse to touch it."""
     if not path.exists():
-        return {}, None, None
+        return {}, None
     raw = path.read_text(encoding="utf-8")
     try:
-        return (json.loads(raw) if raw.strip() else {}), None, None
+        return (json.loads(raw) if raw.strip() else {}), None
     except json.JSONDecodeError as exc:
-        return {}, None, str(exc)
+        return {}, str(exc)
 
 
 
@@ -781,133 +834,71 @@ def _update_env_in_place(entry: Any, env_key: str, db_env: str | None) -> str | 
     return f"{env_key}.SKILLMEM_DB={db_env}"
 
 
-def _patch_mcp_servers_json(
-    config_json: Path,
-    mcp_binary: Path,
-    *,
-    agent: str,
-    db_env: str | None = None,
-) -> dict[str, Any]:
-    """Add ``mcpServers.skillmem`` to an editor config in the Claude shape.
-
-    ``SKILLMEM_AGENT`` marks every skill the editor writes, so authorship stays
-    answerable in a database shared by several agents.
-    """
-    data, backup, err = _read_json_config(config_json)
+def _add_mcp_server(path: Path, key: str, env_key: str, entry: dict[str, Any],
+                    db_env: str | None, agent: str) -> dict[str, Any]:
+    """Add ``<key>.skillmem`` to an editor's JSON config, or point an existing
+    one at --db. ``SKILLMEM_AGENT`` marks every skill the editor writes, so
+    authorship stays answerable in a database shared by several agents."""
+    data, err = _read_json_config(path)
     if err:
-        click.echo(
-            f"warn: {config_json} contains invalid JSON ({err}); refusing to "
-            f"overwrite. Fix it and re-run init.",
-            err=True,
-        )
-        return {"changed": False, "reason": "existing JSON is invalid"}
-
-    servers = data.setdefault("mcpServers", {})
+        return _invalid_json(path, err)
+    servers = data.setdefault(key, {})
+    report = {"agent": agent, "path": str(path)}
     if "skillmem" in servers:
-        r = _update_env_in_place(servers["skillmem"], "env", db_env)
+        r = _update_env_in_place(servers["skillmem"], env_key, db_env)
         if r:
-            backup = _backup_file(config_json)
-            _atomic_write_json(config_json, data)
-            return {"changed": True, "added": r, "agent": agent, "path": str(config_json),
-                    "backup": str(backup) if backup else None}
-        return {"changed": False, "reason": "skillmem MCP already configured",
-                "backup": str(backup) if backup else None}
-
-    env: dict[str, str] = {"SKILLMEM_AGENT": agent}
-    if db_env:
-        env["SKILLMEM_DB"] = db_env
-    servers["skillmem"] = {"command": str(mcp_binary), "args": [], "env": env}
-    backup = _backup_file(config_json)
-    _atomic_write_json(config_json, data)
-    return {"changed": True, "added": "mcpServers.skillmem", "agent": agent,
-            "path": str(config_json),
-            "backup": str(backup) if backup else None}
+            return _write_config(path, data, {"changed": True, "added": r, **report})
+        return {"changed": False, "reason": "skillmem MCP already configured", "backup": None}
+    entry[env_key] = {"SKILLMEM_AGENT": agent, **({"SKILLMEM_DB": db_env} if db_env else {})}
+    servers["skillmem"] = entry
+    return _write_config(path, data, {"changed": True, "added": f"{key}.skillmem", **report})
 
 
+def _remove_mcp_server(path: Path, key: str) -> dict[str, Any]:
+    """Remove the ``<key>.skillmem`` entry init added."""
+    if not path.exists():
+        return {"changed": False, "reason": f"no {path.name}"}
+    data, err = _read_json_config(path)
+    if err:
+        return {"changed": False, "reason": f"could not parse {path}"}
+    servers = data.get(key) or {}
+    if "skillmem" not in servers:
+        return {"changed": False, "reason": "skillmem MCP not configured"}
+    del servers["skillmem"]
+    if not servers:
+        data.pop(key, None)
+    return _write_config(path, data, {"changed": True, "removed": f"{key}.skillmem",
+                                      "path": str(path)})
+
+
+@_patches_config
+def _patch_mcp_servers_json(config_json: Path, mcp_binary: Path, *, agent: str,
+                            db_env: str | None = None) -> dict[str, Any]:
+    """Add ``mcpServers.skillmem`` to an editor config in the Claude shape."""
+    return _add_mcp_server(config_json, "mcpServers", "env",
+                           {"command": str(mcp_binary), "args": []}, db_env, agent)
+
+
+@_patches_config
 def _unpatch_mcp_servers_json(config_json: Path) -> dict[str, Any]:
     """Remove the ``mcpServers.skillmem`` entry added by init."""
-    if not config_json.exists():
-        return {"changed": False, "reason": f"no {config_json.name}"}
-    data, backup, err = _read_json_config(config_json)
-    if err:
-        return {"changed": False, "reason": f"could not parse {config_json}"}
-    servers = data.get("mcpServers") or {}
-    if "skillmem" not in servers:
-        return {"changed": False, "reason": "skillmem MCP not configured"}
-    del servers["skillmem"]
-    if not servers:
-        data.pop("mcpServers", None)
-    backup = _backup_file(config_json)
-    _atomic_write_json(config_json, data)
-    return {"changed": True, "removed": "mcpServers.skillmem",
-            "path": str(config_json), "backup": str(backup) if backup else None}
+    return _remove_mcp_server(config_json, "mcpServers")
 
 
-def _patch_opencode_json(
-    config_json: Path,
-    mcp_binary: Path,
-    *,
-    db_env: str | None = None,
-    agent: str = "opencode",
-) -> dict[str, Any]:
-    """Add an ``mcp.skillmem`` local server to opencode's global config.
-
-    opencode has its own shape: servers live under ``mcp``, the command is an
-    argv array, and environment variables go in ``environment``.
-    """
-    data, backup, err = _read_json_config(config_json)
-    if err:
-        click.echo(
-            f"warn: {config_json} contains invalid JSON ({err}); refusing to "
-            f"overwrite. Fix it and re-run init.",
-            err=True,
-        )
-        return {"changed": False, "reason": "existing JSON is invalid"}
-
-    servers = data.setdefault("mcp", {})
-    if "skillmem" in servers:
-        r = _update_env_in_place(servers["skillmem"], "environment", db_env)
-        if r:
-            backup = _backup_file(config_json)
-            _atomic_write_json(config_json, data)
-            return {"changed": True, "added": r, "agent": agent, "path": str(config_json),
-                    "backup": str(backup) if backup else None}
-        return {"changed": False, "reason": "skillmem MCP already configured",
-                "backup": str(backup) if backup else None}
-
-    env: dict[str, str] = {"SKILLMEM_AGENT": agent}
-    if db_env:
-        env["SKILLMEM_DB"] = db_env
-    servers["skillmem"] = {
-        "type": "local",
-        "command": [str(mcp_binary)],
-        "enabled": True,
-        "environment": env,
-    }
-    backup = _backup_file(config_json)
-    _atomic_write_json(config_json, data)
-    return {"changed": True, "added": "mcp.skillmem", "agent": agent,
-            "path": str(config_json),
-            "backup": str(backup) if backup else None}
+@_patches_config
+def _patch_opencode_json(config_json: Path, mcp_binary: Path, *, db_env: str | None = None,
+                         agent: str = "opencode") -> dict[str, Any]:
+    """Add an ``mcp.skillmem`` local server to opencode's global config: its
+    own shape, an argv array and ``environment``."""
+    return _add_mcp_server(config_json, "mcp", "environment",
+                           {"type": "local", "command": [str(mcp_binary)], "enabled": True},
+                           db_env, agent)
 
 
+@_patches_config
 def _unpatch_opencode_json(config_json: Path) -> dict[str, Any]:
     """Remove the ``mcp.skillmem`` server added by init --opencode."""
-    if not config_json.exists():
-        return {"changed": False, "reason": "no opencode.json"}
-    data, backup, err = _read_json_config(config_json)
-    if err:
-        return {"changed": False, "reason": f"could not parse {config_json}"}
-    servers = data.get("mcp") or {}
-    if "skillmem" not in servers:
-        return {"changed": False, "reason": "skillmem MCP not configured"}
-    del servers["skillmem"]
-    if not servers:
-        data.pop("mcp", None)
-    backup = _backup_file(config_json)
-    _atomic_write_json(config_json, data)
-    return {"changed": True, "removed": "mcp.skillmem",
-            "path": str(config_json), "backup": str(backup) if backup else None}
+    return _remove_mcp_server(config_json, "mcp")
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -919,6 +910,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     """
     import os as _os, stat as _stat, tempfile as _tempfile
     target = path.resolve() if path.is_symlink() else path
+    basis = _CONFIG_BASIS.get(path.resolve(), False)
     target.parent.mkdir(parents=True, exist_ok=True)
     mode = None
     try:
@@ -931,6 +923,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
             f.write(text)
         if mode is not None:
             _os.chmod(tmp, mode)
+        # the last compare, next to the rename: see _patches_config
+        if basis is not False and _file_bytes(target) != basis:
+            raise _ConfigChanged(str(path))
         _os.replace(tmp, target)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -942,8 +937,7 @@ def _toml_str(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-
-
+@_patches_config
 def _patch_codex_config(
     config_toml: Path,
     mcp_binary: Path,
@@ -979,12 +973,8 @@ def _patch_codex_config(
         if servers is not None and not isinstance(servers, dict):
             return {"changed": False, "reason": "mcp_servers is not a table; edit it by hand"}
         if "skillmem" in (servers or {}):
-            # An existing table is left exactly as it is — including the
-            # database it points at. Editing a hand-written TOML in place was
-            # tried and withdrawn: four review rounds found a new edge each
-            # (multi-line strings, comment boundaries, CRLF), and a config
-            # file is not worth that. Moving Codex to another database is
-            # two explicit commands, or one line by hand.
+            # an existing table is left exactly as it is, its database too:
+            # hand-written TOML is not edited in place
             current = None
             entry = servers["skillmem"]
             if isinstance(entry, dict) and isinstance(entry.get("env"), dict):
@@ -1024,6 +1014,7 @@ def _patch_codex_config(
             "backup": str(backup) if backup else None}
 
 
+@_patches_config
 def _unpatch_codex_config(config_toml: Path) -> dict[str, Any]:
     """Remove the ``[mcp_servers.skillmem]`` tables added by init --codex.
 
@@ -1057,10 +1048,7 @@ def _unpatch_codex_config(config_toml: Path) -> dict[str, Any]:
     while out and not out[-1].strip():
         out.pop()
     new_raw = "\n".join(out) + ("\n" if out else "")
-    # Line-level removal from a hand-written TOML: accept it only if the
-    # result parses to exactly the old document minus [mcp_servers.skillmem]
-    # — a header inside a multi-line string, a commented header, anything
-    # else, and we refuse rather than write a broken config.
+    # accepted only if it parses to exactly the old document minus the table
     expect = json.loads(json.dumps(parsed, default=str))
     expect["mcp_servers"].pop("skillmem", None)
     if not expect["mcp_servers"]:
@@ -1080,10 +1068,29 @@ def _unpatch_codex_config(config_toml: Path) -> dict[str, Any]:
             "backup": str(backup)}
 
 
+def _mcp_db(claude_json: Path, fallback: str | None) -> str | None:
+    """The SKILLMEM_DB the skillmem MCP server in ~/.claude.json runs with
+    (None: the default), or ``fallback`` when there is no entry to read."""
+    servers = _read_json_config(claude_json)[0].get("mcpServers")
+    entry = servers.get("skillmem") if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return fallback
+    env = entry.get("env")
+    return env.get("SKILLMEM_DB") if isinstance(env, dict) else None
+
+
 def _venv_script(name: str) -> Path:
     """Console script next to the interpreter: bin/<name> or Scripts\\<name>.exe."""
     scripts = Path(sys.executable).parent
     return scripts / (f"{name}.exe" if sys.platform == "win32" else name)
+
+
+def _mcp_bin(given: Path | None) -> Path:
+    """The skillmem-mcp an agent is wired to, with a warning when it is missing."""
+    binary = given or _venv_script("skillmem-mcp")
+    if not binary.exists():
+        click.echo(f"warn: {binary} not found — install package first", err=True)
+    return binary
 
 
 def _hook_cmd(binary: Path, args: list[str]) -> str:
@@ -1100,6 +1107,7 @@ def _hook_cmd(binary: Path, args: list[str]) -> str:
     return " ".join(_shlex.quote(p) for p in parts)
 
 
+@_patches_config
 def _patch_settings_hook(
     settings_json: Path,
     binary: Path,
@@ -1108,6 +1116,7 @@ def _patch_settings_hook(
     args: list[str],
     matcher: str | None = None,
     timeout: int = 10,
+    db: str | None = None,
 ) -> dict[str, Any]:
     """Add a hook into ``~/.claude/settings.json`` if not already present.
 
@@ -1115,31 +1124,19 @@ def _patch_settings_hook(
     binary path: one event can carry several distinct skillmem hooks
     (verify-gate + auto-recall), while the same hook wired to an older venv
     is rewritten in place rather than doubled — a doubled Stop hook would
-    recap every session twice.
+    recap every session twice. So is one wired to another database: ``db``
+    is the one the MCP server opens, and a hook runs without its env (INV-12).
     """
-    data: dict[str, Any] = {}
-    raw = ""
-    if settings_json.exists():
-        raw = settings_json.read_text(encoding="utf-8")
-        try:
-            data = json.loads(raw) if raw.strip() else {}
-        except json.JSONDecodeError as exc:
-            click.echo(
-                f"warn: {settings_json} contains invalid JSON ({exc}); "
-                f"refusing to overwrite. Fix it and re-run init.",
-                err=True,
-            )
-            return {"changed": False, "reason": "existing JSON is invalid"}
-
-    def _backup() -> Path | None:
-        return _backup_file(settings_json)
+    data, err = _read_json_config(settings_json)
+    if err:
+        return _invalid_json(settings_json, err)
 
     def _scope(m: Any) -> Any:         # Claude Code reads missing, "" and "*" as match-all
         return None if m in (None, "", "*") else m
 
     hooks = data.setdefault("hooks", {})
     event_hooks = hooks.setdefault(event, [])
-    cmd_str = _hook_cmd(binary, args)
+    cmd_str = _hook_cmd(binary, [*(["--db", db] if db else []), *args])
     want = list(args)
     matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for group in event_hooks:
@@ -1164,36 +1161,27 @@ def _patch_settings_hook(
         if not repointed and len(matches) == 1:
             return {"changed": False,
                     "reason": f"{event} hook already present: {' '.join(args)}"}
-        backup = _backup()
-        _atomic_write_json(settings_json, data)
-        what = f"runs {binary}" if repointed else "kept"
+        what = f"runs {cmd_str}" if repointed else "kept"
         if len(matches) > 1:
             what += f", {len(matches) - 1} duplicate(s) removed"
-        return {"changed": True, "updated": f"hooks.{event}: {' '.join(args)} — {what}",
-                "backup": str(backup) if backup else None}
+        return _write_config(settings_json, data, {
+            "changed": True, "updated": f"hooks.{event}: {' '.join(args)} — {what}"})
     group: dict[str, Any] = {
         "hooks": [{"type": "command", "command": cmd_str, "timeout": timeout}]
     }
     if matcher:
         group["matcher"] = matcher
     event_hooks.append(group)
-    backup = _backup()
-    _atomic_write_json(settings_json, data)
-    return {"changed": True, "added": f"hooks.{event}: {' '.join(args) or 'migrate'}",
-            "backup": str(backup) if backup else None}
+    return _write_config(settings_json, data, {
+        "changed": True, "added": f"hooks.{event}: {' '.join(args) or 'migrate'}"})
 
 
 
 def _skillmem_argv(cmd: str) -> list[str] | None:
-    """argv of a hook command if its BINARY is skillmem, else None.
-
-    Parse the way the command was written (shlex on POSIX, list2cmdline on
-    Windows) and match the binary by name — so a quoted path with a space,
-    skillmem.exe or any venv location match, while a foreign hook that merely
-    mentions skillmem in an argument (`audit --log skillmem-audit.log`) or is
-    named `my-skillmem` does not. The substring test that preceded this
-    deleted such hooks on uninstall.
-    """
+    """argv of a hook command if its BINARY is skillmem, else None: parsed
+    as it was written and matched by name, so a hook that merely mentions
+    skillmem (`audit --log skillmem-audit.log`, `my-skillmem`) is not ours.
+    A leading ``--db X`` is left out: it names the database, not the hook."""
     import shlex as _shlex
     try:
         argv = _shlex.split(cmd or "", posix=(sys.platform != "win32"))
@@ -1204,9 +1192,14 @@ def _skillmem_argv(cmd: str) -> list[str] | None:
     from pathlib import PureWindowsPath as _WP
     raw = argv[0].strip('"')                            # list2cmdline keeps the quotes
     name = (_WP(raw) if sys.platform == "win32" else Path(raw)).name.lower()
-    return argv if name in ("skillmem", "skillmem.exe") else None
+    if name not in ("skillmem", "skillmem.exe"):
+        return None
+    if argv[1:2] == ["--db"]:
+        return argv[:1] + argv[3:]
+    return argv[:1] + argv[2:] if argv[1:2] and argv[1].startswith("--db=") else argv
 
 
+@_patches_config
 def _prune_settings_hook(settings_json: Path, *, command_prefix: str) -> dict[str, Any]:
     """Remove hooks whose command ends with ``command_prefix`` (any binary path).
 
@@ -1222,7 +1215,6 @@ def _prune_settings_hook(settings_json: Path, *, command_prefix: str) -> dict[st
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
         return {"changed": False, "reason": "no hooks"}
-    import shlex as _shlex
     want = command_prefix.split()[1:]           # e.g. ["migrate"]
 
     def _is_ours(cmd: str) -> bool:
@@ -1246,20 +1238,55 @@ def _prune_settings_hook(settings_json: Path, *, command_prefix: str) -> dict[st
             del hooks[event]
     if not removed:
         return {"changed": False, "reason": f"no '{command_prefix}' hook present"}
-    backup = _backup_file(settings_json)
-    _atomic_write_json(settings_json, data)
-    return {"changed": True, "removed": f"{removed} hook(s) running '{command_prefix}'",
-            "backup": str(backup)}
+    return _write_config(settings_json, data, {
+        "changed": True, "removed": f"{removed} hook(s) running '{command_prefix}'"})
 
 
+@_patches_config
+def _unpatch_settings(settings_json: Path) -> dict[str, Any]:
+    """Remove every skillmem hook and the deny rules init added (uninstall)."""
+    if not settings_json.exists():
+        return {"changed": False, "reason": "no settings.json"}
+    try:
+        data = json.loads(settings_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"changed": False, "reason": f"could not parse {settings_json}"}
+    changed = False
+    for event, groups in list((data.get("hooks") or {}).items()):
+        new_groups = []
+        for grp in groups:
+            old_hooks = grp.get("hooks") or []
+            new_hooks = [
+                h for h in old_hooks
+                if not isinstance(h, dict)
+                or _skillmem_argv(h.get("command") if isinstance(h.get("command"), str) else "") is None
+            ]
+            if len(new_hooks) != len(old_hooks):
+                changed = True   # also when the group survives (mixed group)
+            if new_hooks:
+                grp["hooks"] = new_hooks
+                new_groups.append(grp)
+        if new_groups:
+            data["hooks"][event] = new_groups
+        elif groups:
+            data["hooks"].pop(event, None)
+            changed = True
+    perms = data.get("permissions")
+    deny = perms.get("deny") if isinstance(perms, dict) else None
+    if isinstance(deny, list):
+        for _rule in _OWNER_DENY_RULES:
+            if _rule in deny:
+                deny.remove(_rule)   # init added it; uninstall reverses init
+                changed = True
+    if not changed:
+        return {"changed": False, "reason": "no skillmem hooks"}
+    return _write_config(settings_json, data, {"changed": True})
+
+
+@_patches_config
 def _patch_settings_deny(settings_json: Path, rule: str) -> dict[str, Any]:
-    """Add a permission deny rule to ~/.claude/settings.json (idempotent).
-
-    `skillmem trust` refuses to run without a TTY, but a TTY can be faked
-    (`script -q /dev/null skillmem trust x`). The deny rule is what actually
-    stops Claude Code from running the command at an injected document's
-    request; the TTY check only catches the accidental case.
-    """
+    """Add a permission deny rule to ~/.claude/settings.json (idempotent);
+    see _OWNER_DENY_RULES for what it does and does not stop."""
     data: dict[str, Any] = {}
     if settings_json.exists():
         try:
@@ -1272,13 +1299,9 @@ def _patch_settings_deny(settings_json: Path, rule: str) -> dict[str, Any]:
     deny = perms.setdefault("deny", [])
     if rule in deny:
         return {"changed": False, "reason": f"deny rule already present: {rule}"}
-    backup: Path | None = None
-    if settings_json.exists():
-        backup = _backup_file(settings_json)
     deny.append(rule)
-    _atomic_write_json(settings_json, data)
-    return {"changed": True, "added": f"permissions.deny: {rule}",
-            "backup": str(backup) if backup else None}
+    return _write_config(settings_json, data, {"changed": True,
+                                               "added": f"permissions.deny: {rule}"})
 
 
 @main.command()
@@ -1319,11 +1342,13 @@ def init(
     hooks_mode: str,
 ) -> None:
     """First-time setup: create DB, migrate auto-memory, wire up your agents."""
+    _BACKED_UP.clear()   # one backup per file per run, not per process
     report: dict[str, Any] = {}
     if all_agents:
         claude_code = codex = cursor = windsurf = gemini = opencode = True
 
     db_path = ctx.obj["db_path"] or S.default_db_path()
+    db_override = str(ctx.obj["db_path"]) if ctx.obj.get("db_path") else None
     conn = _conn(db_path)
     report["db_path"] = str(db_path)
     report["schema_version"] = conn.execute(
@@ -1332,8 +1357,7 @@ def init(
 
     if migrate_existing:
         migrations: list[dict[str, Any]] = []
-        for src in discover_claude_memory_dirs():
-            r = import_dir(conn, src)
+        for src, r in import_dirs(conn, discover_claude_memory_dirs()):
             migrations.append({
                 "source": str(src),
                 "inserted": r.inserted, "updated": r.updated,
@@ -1342,29 +1366,22 @@ def init(
         report["migrations"] = migrations
 
     if claude_code:
-        if mcp_binary is None:
-            mcp_binary = _venv_script("skillmem-mcp")
-        if not mcp_binary.exists():
-            click.echo(f"warn: {mcp_binary} not found — install package first", err=True)
-        claude_json = Path.home() / ".claude.json"
+        mcp_binary = _mcp_bin(mcp_binary)
         report["claude_json"] = _patch_claude_json(
-            claude_json, mcp_binary,
-            db_env=str(ctx.obj["db_path"]) if ctx.obj.get("db_path") else None,
-        )
+            Path.home() / ".claude.json", mcp_binary, db_env=db_override)
 
         settings_json = Path.home() / ".claude" / "settings.json"
         skillmem_bin = _venv_script("skillmem")
 
+        hook_db = _mcp_db(Path.home() / ".claude.json", db_override)
+
         def _hook(event: str, args: list[str], **kw: Any) -> dict[str, Any]:
-            return _patch_settings_hook(settings_json, skillmem_bin,
-                                        event=event, args=args, **kw)
+            return _patch_settings_hook(settings_json, skillmem_bin, event=event,
+                                        args=args, db=hook_db, **kw)
 
         hook_reports: list[dict[str, Any]] = []
-        # No Stop→`skillmem migrate` hook any more: with no --source it
-        # imported the alphabetically-first project's memory dir on every
-        # turn (not this project's), holding a write lock while doing it, and
-        # session-recap already indexes the note it writes. Hand-written
-        # memory files are a `skillmem migrate --source <dir>` job.
+        # the Stop→`skillmem migrate` hook older inits installed is pruned:
+        # session-recap indexes its own note
         if hooks_mode != "none":
             for _rule in _OWNER_DENY_RULES:
                 hook_reports.append(_patch_settings_deny(settings_json, _rule))
@@ -1382,44 +1399,24 @@ def init(
                       matcher="Bash|Edit|Write|NotebookEdit"),
                 # recap invokes `claude -p` — the timeout must cover the LLM call
                 _hook("Stop", ["hook", "session-recap"], timeout=95),
-                # Stop fires per turn and is rate-limited; SessionEnd fires once
-                # and is not, so the closing turns still reach memory. Claude
-                # Code raises the SessionEnd budget to the per-hook timeout but
-                # never past 60s, so asking for more would be a lie.
+                # once, not rate-limited; Claude Code caps SessionEnd at 60s
                 _hook("SessionEnd", ["hook", "session-recap"], timeout=60),
             ]
         report["hooks"] = hook_reports
 
     if codex:
-        codex_binary = mcp_binary or _venv_script("skillmem-mcp")
-        if not codex_binary.exists():
-            click.echo(f"warn: {codex_binary} not found — install package first",
-                       err=True)
         report["codex_config"] = _patch_codex_config(
-            Path.home() / ".codex" / "config.toml", codex_binary,
-            db_env=str(ctx.obj["db_path"]) if ctx.obj.get("db_path") else None,
-        )
+            Path.home() / ".codex" / "config.toml", _mcp_bin(mcp_binary), db_env=db_override)
 
-    db_override = str(ctx.obj["db_path"]) if ctx.obj.get("db_path") else None
-    editors = {"cursor": cursor, "windsurf": windsurf, "gemini": gemini}
-    for agent, wanted in editors.items():
-        if not wanted:
-            continue
-        binary = mcp_binary or _venv_script("skillmem-mcp")
-        if not binary.exists():
-            click.echo(f"warn: {binary} not found — install package first", err=True)
-        report[f"{agent}_config"] = _patch_mcp_servers_json(
-            _agent_config_path(MCP_JSON_AGENTS[agent][0]), binary,
-            agent=agent, db_env=db_override,
-        )
+    for agent, wanted in {"cursor": cursor, "windsurf": windsurf, "gemini": gemini}.items():
+        if wanted:
+            report[f"{agent}_config"] = _patch_mcp_servers_json(
+                _agent_config_path(MCP_JSON_AGENTS[agent][0]), _mcp_bin(mcp_binary),
+                agent=agent, db_env=db_override)
 
     if opencode:
-        binary = mcp_binary or _venv_script("skillmem-mcp")
-        if not binary.exists():
-            click.echo(f"warn: {binary} not found — install package first", err=True)
         report["opencode_config"] = _patch_opencode_json(
-            _agent_config_path(OPENCODE_CONFIG), binary, db_env=db_override,
-        )
+            _agent_config_path(OPENCODE_CONFIG), _mcp_bin(mcp_binary), db_env=db_override)
 
     click.echo(json.dumps(report, ensure_ascii=False, indent=2))
     click.echo("")
@@ -1446,6 +1443,9 @@ def init(
     else:
         click.echo("Done. Open `claude` in any project — the mem_* tools will be there.")
     click.echo("Undo: skillmem uninstall")
+    if any(m["failed"] for m in report.get("migrations", ())):   # as `migrate` (INV-08)
+        click.echo("some memory files failed to import — see migrations above", err=True)
+        sys.exit(1)
 
 
 @main.command()
@@ -1462,60 +1462,25 @@ def init(
 def uninstall(ctx: click.Context, claude_code: bool, codex: bool,
                editors: bool, keep_db: bool) -> None:
     """Reverse `skillmem init`: remove MCP entry + hook. DB stays unless --purge-db."""
+    if not keep_db:
+        _owner_only("uninstall --purge-db")   # deletes every record, sealed ones too
+    _BACKED_UP.clear()   # one backup per file per run, not per process
     report: dict[str, Any] = {"removed": [], "warnings": []}
 
     if claude_code:
         claude_json = Path.home() / ".claude.json"
-        if claude_json.exists():
-            try:
-                data = json.loads(claude_json.read_text(encoding="utf-8"))
-                if "mcpServers" in data and "skillmem" in data["mcpServers"]:
-                    backup = _backup_file(claude_json)
-                    del data["mcpServers"]["skillmem"]
-                    if not data["mcpServers"]:
-                        del data["mcpServers"]
-                    _atomic_write_json(claude_json, data)
-                    report["removed"].append(f"mcpServers.skillmem (backup: {backup})")
-            except json.JSONDecodeError:
-                report["warnings"].append(f"could not parse {claude_json}")
+        r = _unpatch_mcp_servers_json(claude_json)
+        if r["changed"]:
+            report["removed"].append(f"mcpServers.skillmem (backup: {r['backup']})")
+        elif r["reason"].startswith("could not parse"):
+            report["warnings"].append(f"could not parse {claude_json}")
 
         settings_json = Path.home() / ".claude" / "settings.json"
-        if settings_json.exists():
-            try:
-                data = json.loads(settings_json.read_text(encoding="utf-8"))
-                changed = False
-                for event, groups in list((data.get("hooks") or {}).items()):
-                    new_groups = []
-                    for grp in groups:
-                        old_hooks = grp.get("hooks") or []
-                        new_hooks = [
-                            h for h in old_hooks
-                            if not isinstance(h, dict)
-                            or _skillmem_argv(h.get("command") if isinstance(h.get("command"), str) else "") is None
-                        ]
-                        if len(new_hooks) != len(old_hooks):
-                            changed = True   # also when the group survives (mixed group)
-                        if new_hooks:
-                            grp["hooks"] = new_hooks
-                            new_groups.append(grp)
-                    if new_groups:
-                        data["hooks"][event] = new_groups
-                    elif groups:
-                        data["hooks"].pop(event, None)
-                        changed = True
-                perms = data.get("permissions")
-                deny = perms.get("deny") if isinstance(perms, dict) else None
-                if isinstance(deny, list):
-                    for _rule in _OWNER_DENY_RULES:
-                        if _rule in deny:
-                            deny.remove(_rule)   # init added it; uninstall reverses init
-                            changed = True
-                if changed:
-                    backup = _backup_file(settings_json)
-                    _atomic_write_json(settings_json, data)
-                    report["removed"].append(f"hooks pointing to skillmem (backup: {backup})")
-            except json.JSONDecodeError:
-                report["warnings"].append(f"could not parse {settings_json}")
+        r = _unpatch_settings(settings_json)
+        if r["changed"]:
+            report["removed"].append(f"hooks pointing to skillmem (backup: {r['backup']})")
+        elif r["reason"].startswith("could not parse"):
+            report["warnings"].append(f"could not parse {settings_json}")
 
     if codex:
         r = _unpatch_codex_config(Path.home() / ".codex" / "config.toml")
@@ -1546,34 +1511,35 @@ def uninstall(ctx: click.Context, claude_code: bool, codex: bool,
 
     if not keep_db:
         db = ctx.obj.get("db_path") or S.default_db_path()
-        # the DB's own body files go with it (this DB's namespace only; the
-        # docs/ directory is shared by every database under one home)
+        # the DB's own body files go with it: its namespace only. A pre-0.11
+        # name could be any database's, a copy's original too (INV-12)
+        own: str | None = None
         try:
             conn = S.connect(db)
-            ns = S._db_namespace(conn)
-            # legacy (pre-0.11) names carry no namespace: only the ones THIS
-            # database references are ours — another DB may use the rest
-            mine = {r[0] for r in conn.execute(
-                "SELECT body_path FROM memory_items WHERE body_path IS NOT NULL")}
+            own = S._own_namespace(conn)
             conn.close()
-            for p in S.docs_dir().glob("*.md"):
-                m = S._BODY_FILE_RE.search(p.name)
-                if m is None:
-                    continue
-                if m.group("content") is None:
-                    if p.name not in mine:
-                        continue
-                elif (m.group("ns") or "") != (f"-{ns}" if ns else ""):
+        except Exception as exc:  # noqa: BLE001
+            report["warnings"].append(f"body files: {exc}")
+        # the database before its body files: Windows refuses to delete a file
+        # another process has open, and its records were left without their text
+        for suffix in ("", "-wal", "-shm"):
+            f = db.with_name(db.name + suffix)
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError as exc:
+                    raise click.ClickException(
+                        f"cannot delete {f}: {exc} — stop what has it open "
+                        "(an MCP or HTTP server) and run this again")
+                report["removed"].append(f"DB {f}")
+        try:
+            for p in S.docs_dir().glob("*.md") if own is not None else ():
+                if S._file_namespace(p.name) != own:
                     continue
                 p.unlink(missing_ok=True)
                 report["removed"].append(f"body file {p.name}")
         except Exception as exc:  # noqa: BLE001
             report["warnings"].append(f"body files: {exc}")
-        for suffix in ("", "-wal", "-shm"):
-            f = db.with_name(db.name + suffix)
-            if f.exists():
-                f.unlink()
-                report["removed"].append(f"DB {f}")
 
     click.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
@@ -1603,17 +1569,9 @@ def tokens_init_cmd(path: Path, agents: str) -> None:
         elif modifier:
             cfg["permissions"] = [modifier]
         bucket[name] = cfg
-    import os as _os
-    import yaml as _yaml
+    from .export import dump_yaml
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic create with restrictive mode — closes the chmod race window.
-    fd = _os.open(str(path), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-    try:
-        with _os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(_yaml.safe_dump(bucket, sort_keys=False, allow_unicode=True))
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+    _write_secret(path, dump_yaml(bucket))
     click.echo(f"OK: {path} (chmod 0600)")
     click.echo("Edit this file to set per-agent topics, then start the server:")
     click.echo(f"  skillmem-server --tokens {path}")
@@ -1649,16 +1607,25 @@ def _token_file() -> Path:
     return S.default_data_dir() / "github_token"
 
 
-def _github_token() -> tuple[str | None, str]:
-    """Resolve the GitHub token: env → token file → `gh auth token`."""
+def _default_repo() -> str:
+    return os.environ.get("SKILLMEM_GITHUB_REPO", DEFAULT_GITHUB_REPO)
+
+
+def _github_token(repo: str) -> tuple[str | None, str]:
+    """Resolve the GitHub token for ``repo``: env → token file → `gh auth token`.
+    The file's token goes only to the repository stored beside it (INV-16); a
+    file that names none is sent nowhere."""
     tok = os.environ.get("SKILLMEM_GITHUB_TOKEN")
     if tok:
         return tok.strip(), "env SKILLMEM_GITHUB_TOKEN"
     tf = _token_file()
-    if tf.exists():
-        tok = tf.read_text(encoding="utf-8").strip()
-        if tok:
-            return tok, f"file {tf}"
+    stored = tf.read_text(encoding="utf-8").split() if tf.exists() else []
+    if len(stored) == 2 and stored[0].casefold() == repo.casefold():
+        return stored[1], f"file {tf}"
+    if stored:
+        return None, (f"file {tf} holds a token for "
+                      f"{stored[0] if len(stored) == 2 else 'no repository'}, not {repo}; "
+                      f"`skillmem token set --repo {repo} <TOKEN>`")
     import shutil as _shutil
     import subprocess as _subprocess
     gh = _shutil.which("gh")
@@ -1674,15 +1641,27 @@ def _github_token() -> tuple[str | None, str]:
     return None, "not found"
 
 
-def _gh_get(url: str, token: str, *, accept: str, timeout: int = 30) -> bytes:
+def _gh_get(url: str, token: str | None, *, accept: str, timeout: int = 30) -> bytes:
     import urllib.request as _urlreq
-    req = _urlreq.Request(url, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": accept,
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "skillmem-upgrade",
-    })
-    with _urlreq.urlopen(req, timeout=timeout) as resp:
+    from urllib.parse import urlsplit
+
+    class SameOrigin(_urlreq.HTTPRedirectHandler):
+        """A redirect keeps the token only to the origin it was sent to:
+        urllib forwarded it to any host (INV-16)."""
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            new = super().redirect_request(req, fp, code, msg, headers, newurl)
+            a, b = urlsplit(req.full_url), urlsplit(newurl)
+            if new is not None and (a.scheme, a.hostname, a.port) != (
+                    b.scheme, b.hostname, b.port):
+                new.remove_header("Authorization")
+            return new
+
+    headers = {"Accept": accept, "X-GitHub-Api-Version": "2022-11-28",
+               "User-Agent": "skillmem-upgrade"}
+    if token:                      # the public repo needs none
+        headers["Authorization"] = f"Bearer {token}"
+    req = _urlreq.Request(url, headers=headers)
+    with _urlreq.build_opener(SameOrigin).open(req, timeout=timeout) as resp:
         return resp.read()
 
 
@@ -1691,28 +1670,34 @@ def token_group() -> None:
     """Read-only GitHub token for `skillmem upgrade` (private releases)."""
 
 
+_REPO_OPTION = click.option("--repo", default=None,
+                            help="GitHub repo the token is for (default: SKILLMEM_GITHUB_REPO, "
+                                 f"else {DEFAULT_GITHUB_REPO})")
+
+
 @token_group.command("set")
 @click.argument("value")
-def token_set(value: str) -> None:
-    """Save the token to a file (chmod 600). The value is never printed."""
+@_REPO_OPTION
+def token_set(value: str, repo: str | None) -> None:
+    """Save the token for one repo to a file (chmod 600). The value is never printed."""
+    repo = repo or _default_repo()
+    if len(value.split()) != 1 or len(repo.split()) != 1:
+        raise click.BadParameter("a token and a repo are one word each")
     tf = _token_file()
     tf.parent.mkdir(parents=True, exist_ok=True)
-    tf.write_text(value.strip() + "\n", encoding="utf-8")
-    try:
-        tf.chmod(0o600)  # no-op on Windows; the file lives in the user profile anyway
-    except Exception:
-        pass
-    click.echo(f"token saved → {tf}")
+    _write_secret(tf, f"{repo} {value.strip()}\n")
+    click.echo(f"token for {repo} saved → {tf}")
 
 
 @token_group.command("status")
-def token_status() -> None:
+@_REPO_OPTION
+def token_status(repo: str | None) -> None:
     """Show where the token will be taken from (the value itself is never printed)."""
-    tok, source = _github_token()
+    tok, source = _github_token(repo or _default_repo())
     click.echo(f"token: {'present' if tok else 'MISSING'} ({source})")
     if not tok:
         click.echo("Get one: a fine-grained PAT for the repo with Contents:Read,")
-        click.echo("then `skillmem token set <TOKEN>` (or env SKILLMEM_GITHUB_TOKEN).")
+        click.echo("then `skillmem token set --repo OWNER/NAME <TOKEN>` (or env SKILLMEM_GITHUB_TOKEN).")
 
 
 @token_group.command("clear")
@@ -1743,6 +1728,22 @@ def _version_key(v: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _wants_upgrade(current: str, latest: str, check_only: bool) -> bool:
+    """Say how ``current`` compares to ``latest``; True when there is an
+    upgrade to install."""
+    if current == latest:
+        click.echo("✓ up to date")
+        return False
+    if _version_key(latest) <= _version_key(current):
+        click.echo(f"warn: installed {current} is newer than latest {latest}", err=True)
+        return False
+    if check_only:
+        click.echo(f"upgrade available: {current} → {latest}")
+        click.echo("Run `skillmem upgrade` to install.")
+        return False
+    return True
+
+
 def _upgrade_via_github(check_only: bool, repo: str, token_opt: str | None) -> None:
     """GitHub Releases channel: authenticated check + offline reinstall."""
     import hashlib as _hashlib
@@ -1750,19 +1751,17 @@ def _upgrade_via_github(check_only: bool, repo: str, token_opt: str | None) -> N
     import tempfile as _tempfile
     from . import __version__
 
-    token = token_opt or _github_token()[0]
-    if not token:
-        click.echo("no GitHub token — private releases need auth.", err=True)
-        click.echo("Fix: `skillmem token set <TOKEN>` (fine-grained PAT, "
-                   "Contents:Read on the repo) or env SKILLMEM_GITHUB_TOKEN, "
-                   "or `gh auth login`.", err=True)
-        sys.exit(2)
-
+    # the public repo takes no token: a stale stored one turned every check into a 401
+    token = token_opt or (None if repo == DEFAULT_GITHUB_REPO else _github_token(repo)[0])
     api = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
         release = json.loads(_gh_get(api, token, accept="application/vnd.github+json"))
     except Exception as exc:
         click.echo(f"could not fetch {api}: {exc}", err=True)
+        if not token:
+            click.echo("A private repo needs a token: `skillmem token set --repo OWNER/NAME <TOKEN>` "
+                       "(fine-grained PAT, Contents:Read), env SKILLMEM_GITHUB_TOKEN, "
+                       "or `gh auth login`.", err=True)
         sys.exit(1)
 
     latest = str(release.get("tag_name") or "").lstrip("v")
@@ -1771,15 +1770,7 @@ def _upgrade_via_github(check_only: bool, repo: str, token_opt: str | None) -> N
     click.echo(f"latest:    {latest or 'unknown'} (github.com/{repo})")
     if not latest:
         sys.exit(1)
-    if current == latest:
-        click.echo("✓ up to date")
-        return
-    if _version_key(latest) <= _version_key(current):
-        click.echo(f"warn: installed {current} is newer than latest {latest}", err=True)
-        return
-    if check_only:
-        click.echo(f"upgrade available: {current} → {latest}")
-        click.echo("Run `skillmem upgrade` to install.")
+    if not _wants_upgrade(current, latest, check_only):
         return
 
     assets = {a["name"]: a for a in release.get("assets", [])}
@@ -1787,9 +1778,10 @@ def _upgrade_via_github(check_only: bool, repo: str, token_opt: str | None) -> N
         (n for n in assets if n.endswith(".tar.gz") and not n.endswith(".sha256")), None)
     installer_name = "install.ps1" if sys.platform == "win32" else "install.sh"
     if not tarball_name or installer_name not in assets:
-        click.echo(f"release v{latest} is missing assets "
-                   f"(need <pkg>.tar.gz + {installer_name}; "
-                   f"have: {', '.join(assets) or 'none'})", err=True)
+        # the public releases ship through PyPI, not as release assets
+        click.echo(f"release v{latest} carries no installer assets; upgrade the "
+                   f"way you installed: `pip install -U skillmem` (or "
+                   f"`uv tool upgrade skillmem`)", err=True)
         sys.exit(1)
 
     click.echo(f"upgrading {current} → {latest}")
@@ -1855,7 +1847,7 @@ def upgrade(check_only: bool, repo: str | None, token_opt: str | None,
     if not version_url:
         _upgrade_via_github(
             check_only,
-            repo or _os.environ.get("SKILLMEM_GITHUB_REPO", DEFAULT_GITHUB_REPO),
+            repo or _default_repo(),
             token_opt,
         )
         return
@@ -1877,16 +1869,7 @@ def upgrade(check_only: bool, repo: str | None, token_opt: str | None,
 
     if latest is None:
         sys.exit(1 if check_only else 0)
-
-    if current == latest:
-        click.echo("✓ up to date")
-        return
-    if _version_key(latest) <= _version_key(current):
-        click.echo(f"warn: installed {current} is newer than latest {latest}", err=True)
-        return
-    if check_only:
-        click.echo(f"upgrade available: {current} → {latest}")
-        click.echo("Run `skillmem upgrade` to install.")
+    if not _wants_upgrade(current, latest, check_only):
         return
 
     if not install_url:
@@ -1895,33 +1878,25 @@ def upgrade(check_only: bool, repo: str | None, token_opt: str | None,
 
     click.echo(f"upgrading {current} → {latest}")
     click.echo("Re-executing installer in place...")
-    # Download first, then exec the file. The old form built a shell string
-    # ("curl -sSL {url} | bash"), so any shell metacharacter in a URL taken from
-    # an env var or --url ran as a command. No shell is involved now.
+    # downloaded, then executed: no shell ever sees the URL
     import tempfile as _tempfile
 
-    if sys.platform == "win32":
-        # Distribution convention: install.ps1 sits next to install.sh.
-        if install_url.endswith("install.sh"):
-            install_url = install_url[: -len("install.sh")] + "install.ps1"
-        with _urlreq.urlopen(install_url, timeout=30) as resp:
-            script = resp.read()
-        with _tempfile.NamedTemporaryFile("wb", suffix=".ps1", delete=False) as fh:
-            fh.write(script)
-            script_path = fh.name
+    windows = sys.platform == "win32"
+    if windows and install_url.endswith("install.sh"):
+        install_url = install_url[: -len("install.sh")] + "install.ps1"   # it sits beside it
+    with _urlreq.urlopen(install_url, timeout=30) as resp:
+        script = resp.read()
+    with _tempfile.NamedTemporaryFile("wb", suffix=".ps1" if windows else ".sh",
+                                      delete=False) as fh:
+        fh.write(script)
+        script_path = fh.name
+    if windows:
         _os.execvp("powershell", [
             "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", script_path, "-NoClaudeCode",
         ])  # noqa: never returns
-
-    with _urlreq.urlopen(install_url, timeout=30) as resp:
-        script = resp.read()
-    with _tempfile.NamedTemporaryFile("wb", suffix=".sh", delete=False) as fh:
-        fh.write(script)
-        script_path = fh.name
     _os.chmod(script_path, 0o700)
-    # execvp replaces this process — the old binary is safe to overwrite once
-    # we've handed off to the installer.
+    # execvp replaces this process: the old binary is safe to overwrite
     _os.execvp("bash", ["bash", script_path, "--no-claude-code"])  # noqa: never returns
 
 
@@ -1933,9 +1908,6 @@ def verify(ctx: click.Context, strict: bool) -> None:
     conn = _conn(ctx.obj["db_path"])
     checked, breaks = S.verify_history(conn)
     click.echo(f"checked {checked} history rows")
-    # The chain says nothing about a file on disk, and bodies over the threshold
-    # live in one: a single file write changed approved words with every column
-    # and every hash in the database left intact.
     bad_bodies = S.mismatched_bodies(conn)
     if bad_bodies:
         click.echo(f"BODY MISMATCH: {len(bad_bodies)} record(s) whose body file no "
@@ -1990,6 +1962,7 @@ def _semantic_report() -> dict:
     """
     from . import embed
 
+    embed.allow_download()      # the one place a person waits for ~220 MB
     report: dict = {"model": embed.MODEL_NAME, "cache_dir": embed.model_cache_dir()}
     if not embed.semantic_enabled():
         report["status"] = "off (MEM_SEMANTIC=0)"
@@ -2036,25 +2009,21 @@ def learn(
 ) -> None:
     """Record an after-action skill from task experience."""
     conn = _conn(ctx.obj["db_path"])
-    trusted_at, trusted_by = _owner_trust()
     item = S.MemoryItem(
         slug=slug,
         kind="skill",
         title=title,
         body=S.skill_body(trigger, steps, outcome, lessons),
-        origin="owner" if trusted_at else "agent",
-        trusted_at=trusted_at, trusted_by=trusted_by,
+        origin="owner" if S.owner_present() else "agent",
         project=project,
-        tags=[t.strip() for t in tags.split(",")] if tags else [],
+        tags=[t.strip() for t in tags.split(",") if t.strip()] if tags else [],
         visibility="public",
     )
     try:
-        result = S.upsert(conn, item, links=S.extract_wikilinks(item.body),
-                          owner_call=S.owner_present(),   # a person at a terminal
-                          # what was typed applies; visibility is never flipped on same text
-                          explicit={p for p in ("tags", "project")
-                                    if ctx.get_parameter_source(p) == click.core.ParameterSource.COMMANDLINE})
-    except (S.MemoryConflict, ValueError) as exc:
+        result = S.upsert_skill(conn, item, surface="cli",
+                                explicit={p for p in ("tags", "project")
+                                          if ctx.get_parameter_source(p) == click.core.ParameterSource.COMMANDLINE})
+    except (S.MemoryConflict, S.SealedRecord, ValueError) as exc:
         click.echo(f"CONFLICT: {exc}", err=True)
         sys.exit(1)
     click.echo(f"Learned: {result.slug} (id={result.id})")
@@ -2062,7 +2031,7 @@ def learn(
 
 @main.command()
 @click.argument("query")
-@click.option("--limit", "-n", default=5, type=int)
+@click.option("--limit", "-n", default=5, type=click.IntRange(min=1))
 @click.option("--no-reinforce", is_flag=True, help="Don't bump strength on retrieval.")
 @click.option(
     "--format",
@@ -2101,7 +2070,7 @@ def recall(ctx: click.Context, query: str, limit: int, no_reinforce: bool, fmt: 
 
 
 @main.command("skills-top")
-@click.option("--limit", "-n", default=50, type=int)
+@click.option("--limit", "-n", default=50, type=click.IntRange(min=1))
 @click.pass_context
 def skills(ctx: click.Context, limit: int) -> None:
     """List skills with strength and access count (was `skills`, which the
@@ -2111,10 +2080,12 @@ def skills(ctx: click.Context, limit: int) -> None:
     if not items:
         click.echo("No skills yet.")
         return
+    from .hooks import frame_title
     for item in items:
         strength_bar = "█" * int(item.strength * 5)
+        title = frame_title(item)
         click.echo(
-            f"  [{item.slug}] {item.title}\n"
+            f"  [{item.slug}] " + (title if item.trusted_at else "\n" + title) + "\n"
             f"    strength={item.strength:.2f} {strength_bar}  "
             f"access={item.access_count}  "
             f"created={item.created_at}"
@@ -2128,9 +2099,7 @@ def skills(ctx: click.Context, limit: int) -> None:
 def decay(ctx: click.Context, days: int) -> None:
     """Run Ebbinghaus decay on unused skills."""
     conn = _conn(ctx.obj["db_path"])
-    # The nightly job is where a minute of CPU is affordable: v11 needs the lexical
-    # index rebuilt, and doing it in a hook would blow the hook's timeout.
-    if S.lexical_reindex_pending(conn):
+    if S.lexical_reindex_pending(conn):     # a minute of CPU, affordable here only
         n = S.restem_all(conn)
         click.echo(f"Rebuilt the lexical index for {n} memories (v11).")
     decayed = S.decay_stale(conn, days_threshold=days)
@@ -2140,10 +2109,8 @@ def decay(ctx: click.Context, days: int) -> None:
         click.echo(f"  {d['slug']}: {d['old_strength']:.3f} → {d['new_strength']:.3f}")
     if decayed:
         click.echo(f"Decayed {len(decayed)} skills.")
-    # Lifecycle sweep rides on the same scheduled run (active -> stale -> archived).
-    # It runs whether or not anything decayed: once idle skills sit at the
-    # floor there is nothing left to decay, and that is exactly when they
-    # should be archived — an early return here meant nothing ever was.
+    # the sweep runs whether or not anything decayed: skills at the floor are
+    # exactly the ones it archives
     sweep = S.sweep_lifecycle(conn)
     gc = S.gc_body_files(conn)
     if gc:
@@ -2189,15 +2156,16 @@ def pin(ctx: click.Context, slug: str, off: bool) -> None:
     useless.
     """
     conn = _conn(ctx.obj["db_path"])
-    result = S.set_pinned(conn, slug, not off)
+    try:
+        result = S.set_pinned(conn, slug, not off)
+    except S.SealedRecord as exc:
+        raise SystemExit(str(exc))
     if not result:
         click.echo(f"not found: {slug}", err=True)
         sys.exit(1)
     state = "pinned" if result["pinned"] else "unpinned"
     click.echo(f"{state}: {slug}" + ("" if result["changed"] else " (already)"))
-    if result["lifecycle"] == "archived":
-        # pinning does not un-archive, and archiving is refused while pinned:
-        # without this line the record silently stays out of every read
+    if result["lifecycle"] == "archived":     # pinning does not un-archive
         click.echo(f"note: '{slug}' is archived and stays out of search, recall and "
                    f"inject — run `skillmem skills-restore {slug}` to bring it back.")
 
@@ -2230,8 +2198,10 @@ def skills_add(ctx: click.Context, source: str, name: str | None, dry_run: bool)
         sys.exit(1)
     click.echo(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     verb = "would import" if dry_run else "imported"
-    click.echo(f"\n{verb} {len(report.imported)} skills from {report.pack}"
-               + (f" (licence: {report.license})" if report.license else ""))
+    click.echo(f"\n{verb} {len(report.imported)} skills from {report.pack}")
+    if report.skipped:
+        # a skill that was not written is a failure, as in import-vault (INV-08)
+        sys.exit(1)
 
 
 @skills.command("ls")
@@ -2259,6 +2229,8 @@ def skills_rm(ctx: click.Context, pack: str, reason: str) -> None:
     """Remove every skill imported from a pack (soft delete, history kept)."""
     from .packs import remove_pack
 
+    # a whole pack at once, where `rm` of one of its skills was refused
+    _owner_only("skills rm")
     removed = remove_pack(_conn(ctx.obj["db_path"]), pack, reason=reason)
     if not removed:
         click.echo(f"no skills found for pack: {pack}", err=True)
@@ -2300,11 +2272,7 @@ def skills_lifecycle(ctx: click.Context) -> None:
 @click.pass_context
 def skills_restore(ctx: click.Context, slug: str) -> None:
     """Restore an archived/stale skill back to active."""
-    conn = _conn(ctx.obj["db_path"])
-    if S.restore_skill(conn, slug):
-        click.echo(f"Restored '{slug}' → active.")
-    else:
-        click.echo(f"Skill '{slug}' not found.")
+    ctx.invoke(skills_archive, slug=slug, restore=True)
 
 
 @main.command("skills-archive")
@@ -2315,22 +2283,13 @@ def skills_archive(ctx: click.Context, slug: str, restore: bool) -> None:
     """Archive any record, including the owner's own approved rules.
 
     Taking a record out of search, recall, list and the session briefing is the
-    owner's call, and this is the only place it is made: there is no MCP tool for
-    it. Ten review rounds established that an agent able to hide a record leaves
-    the owner no trace of it, and each gate we built was one call from open.
+    owner's call, and this is the only place it is made: there is no MCP tool
+    for it. Both directions, and `skills-restore` comes through here too.
     """
-    at_terminal = S.owner_present()
-    if not restore and not at_terminal:
-        # Reachable from Bash this was the same hole under another name, and it
-        # signed the history row "owner-cli" whoever ran it.
-        raise SystemExit(
-            "refusing: `skills-archive` needs a person at a terminal (no TTY). "
-            "Run it yourself, not through an agent."
-        )
+    _owner_only("skills-archive --restore" if restore else "skills-archive")
     conn = _conn(ctx.obj["db_path"])
     try:
-        res = S.set_archived(conn, slug, not restore,
-                             by="owner-cli" if at_terminal else "cli-no-tty")
+        res = S.set_archived(conn, slug, not restore, by="owner-cli")
     except (S.SealedRecord, ValueError) as exc:
         raise SystemExit(str(exc))
     if not res:
@@ -2360,6 +2319,8 @@ def skills_dups(ctx: click.Context, threshold: float) -> None:
 @click.pass_context
 def reindex_embeddings(ctx: click.Context, all_rows: bool) -> None:
     """Backfill semantic embeddings for stored memories (needs fastembed)."""
+    from . import embed
+    embed.allow_download()
     conn = _conn(ctx.obj["db_path"])
     res = S.reindex_embeddings(conn, only_missing=not all_rows)
     if res.get("unavailable"):

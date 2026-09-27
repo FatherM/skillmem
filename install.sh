@@ -148,7 +148,8 @@ else
         fail "could not download $PACKAGE_URL — check URL or network"
 fi
 
-# Verify SHA256 against ${URL}.sha256 (fail closed if checksum file missing).
+# Verify SHA256 against ${URL}.sha256 when the host publishes one; without it
+# the install proceeds with a warning (there is nothing to verify against).
 # This is not bulletproof against a fully compromised host (attacker could
 # rewrite both files), but it does stop accidental cache poisoning and many
 # transit-layer attacks. For internal tooling that's a reasonable trade-off.
@@ -209,7 +210,7 @@ say "Symlinks → $BIN_DIR/{skillmem,skillmem-mcp,skillmem-server}"
 # which just looks like skillmem hanging. Non-fatal: recall falls back to BM25.
 if [[ "$WITH_SEMANTIC" == "1" ]]; then
     say "Downloading embedding model (~220 MB, one time — first search would otherwise stall)"
-    if "$PKG_DIR/.venv/bin/python" -c 'import sys; from skillmem import embed; sys.exit(0 if embed.available() else 1)' 2>/dev/null; then
+    if "$PKG_DIR/.venv/bin/python" -c 'import sys; from skillmem import embed; sys.exit(0 if embed.allow_download() or embed.available() else 1)' 2>/dev/null; then
         say "Semantic recall ready"
     else
         warn "model download failed — recall will use BM25 until it succeeds"
@@ -257,5 +258,5 @@ Docs:   $PKG_DIR/README.md
 Logs:   $INSTALL_ROOT/
 Uninstall:
     skillmem uninstall
-    rm -rf $INSTALL_ROOT $BIN_DIR/skillmem*
+    rm -rf "$INSTALL_ROOT" "$BIN_DIR"/skillmem*
 EOF

@@ -18,30 +18,29 @@ Token file format (YAML)::
 
 Visibility rules:
 - ``public`` — everyone.
-- ``shared`` — only agents whose ``topics`` intersect the row's topics.
+- ``shared`` — its author, and agents whose ``topics`` intersect the row's topics.
 - ``private`` — only the author (``agent`` column).
 - ``master`` scope — bypasses all of the above.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
-import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 import uvicorn
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from . import storage as S
 from . import __version__
-from .hooks import frame_for_model
+from .hooks import frame_for_model, frame_history, frame_title
 
 
 # --------------------------------------------------------------------------- #
@@ -79,6 +78,8 @@ class TokenStore:
             raise ValueError("tokens file must be a YAML mapping of agent → config")
         bucket: dict[str, AgentIdentity] = {}
         for name, cfg in raw.items():
+            if not isinstance(name, str) or not name:   # "" is stored as no author: 404 on its own write
+                raise ValueError(f"agent name {name!r} must be a non-empty string")
             if not isinstance(cfg, dict) or "token" not in cfg:
                 raise ValueError(f"agent '{name}' missing 'token'")
             scope = cfg.get("scope", "agent")
@@ -103,13 +104,8 @@ class TokenStore:
 
 
 def _predicate(agent: "AgentIdentity"):
-    """The visibility predicate for the storage rankers — or None for master.
-
-    Master sees everything, so it takes the unfiltered path: same fixed
-    candidate pool, same ranking and cost as the CLI and MCP. Handing master
-    a predicate made HTTP rank on an unbounded pool nobody benchmarked and
-    return a different top-5 than every other surface.
-    """
+    """The visibility predicate for the storage rankers — or None for master,
+    which takes the unfiltered path and ranks as the CLI and MCP do."""
     if agent.is_master:
         return None
     return lambda m: _visible_to(m, agent)
@@ -118,21 +114,22 @@ def _predicate(agent: "AgentIdentity"):
 def _visible_to(row: dict[str, Any] | S.MemoryItem, agent: AgentIdentity) -> bool:
     if agent.is_master:
         return True
-    if isinstance(row, S.MemoryItem):
-        visibility = row.visibility
-        topics = row.topics
-        author = row.agent
-    else:
-        visibility = row.get("visibility", "private")
-        topics = row.get("topics") or []
-        author = row.get("agent")
+    visibility, author = _owner_of(row)
+    topics = row.topics if isinstance(row, S.MemoryItem) else row.get("topics") or []
     if visibility == "public":
         return True
-    if visibility == "shared":
-        return any(t in agent.topics for t in topics)
+    if visibility == "shared":     # its author too (INV-08)
+        return author == agent.name or any(t in agent.topics for t in topics)
     if visibility == "private":
         return author == agent.name
     return False
+
+
+def _owner_of(row: dict[str, Any] | S.MemoryItem) -> tuple[str, str | None]:
+    """(visibility, author) of a row or an item."""
+    if isinstance(row, S.MemoryItem):
+        return row.visibility, row.agent
+    return row.get("visibility", "private"), row.get("agent")
 
 
 def _may_write(row: dict[str, Any] | S.MemoryItem, agent: AgentIdentity) -> bool:
@@ -144,13 +141,24 @@ def _may_write(row: dict[str, Any] | S.MemoryItem, agent: AgentIdentity) -> bool
     """
     if agent.is_master:
         return True
-    if isinstance(row, S.MemoryItem):
-        visibility, author = row.visibility, row.agent
-    else:
-        visibility, author = row.get("visibility", "private"), row.get("agent")
+    visibility, author = _owner_of(row)
     if visibility == "public":
         return agent.can("write_public")
     return author == agent.name
+
+
+@contextmanager
+def _refusals():
+    """A storage refusal as its HTTP status: the owner's record 403, a
+    conflict 409, an invalid field 422."""
+    try:
+        yield
+    except S.SealedRecord as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except S.MemoryConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 # --------------------------------------------------------------------------- #
@@ -165,16 +173,21 @@ class SearchRequest(BaseModel):
     limit: int = Field(10, ge=1, le=100)
 
 
-class WriteRequest(BaseModel):
+class CreateRequest(BaseModel):
+    # Defaults are not validated: only omission gets the internal None sentinel.
+    # A supplied value must be one of these strings, including on same-text retries.
+    visibility: Literal["public", "shared", "private"] = None
+
+
+class WriteRequest(CreateRequest):
     slug: str
     title: str
     body: str
     kind: str = "note"
     project: str | None = None
-    tags: list[str] = Field(default_factory=list)
-    topics: list[str] = Field(default_factory=list)
-    visibility: Literal["public", "shared", "private"] | None = None   # None = private for new, unchanged for existing
-    ttl_days: int | None = None
+    tags: list[str] | None = None       # null clears, as over MCP and /update
+    topics: list[str] | None = None
+    ttl_days: StrictInt | None = None   # a lax int stored `true` as one day (INV-14)
     check_conflicts: bool = True
 
 
@@ -194,7 +207,7 @@ class ListRequest(BaseModel):
     limit: int = Field(50, ge=1, le=500)
 
 
-class LearnRequest(BaseModel):
+class LearnRequest(CreateRequest):
     slug: str
     title: str
     trigger: str
@@ -202,10 +215,9 @@ class LearnRequest(BaseModel):
     outcome: str
     lessons: str | None = None
     project: str | None = None
-    tags: list[str] = Field(default_factory=list)
-    topics: list[str] = Field(default_factory=list)
-    visibility: Literal["public", "shared", "private"] | None = None   # None = public for new, unchanged for existing
-    ttl_days: int | None = None
+    tags: list[str] | None = None       # null clears, as over MCP and /update
+    topics: list[str] | None = None
+    ttl_days: StrictInt | None = None   # a lax int stored `true` as one day (INV-14)
     check_conflicts: bool = True
 
 
@@ -224,20 +236,20 @@ def build_app(token_store: TokenStore, db_path: Path | None = None) -> FastAPI:
     app = FastAPI(title="skillmem", version=__version__)
     bearer = HTTPBearer(auto_error=True)
 
-    # One connection per worker thread, reused across requests. The previous
-    # code opened a fresh connection on every call and never closed it: each
-    # request left a WAL reader alive until the GC happened to collect it.
-    # SQLite connections are not safe to share between threads, so a
-    # thread-local is the bounded fix — at most one per threadpool worker.
-    _conns = threading.local()
+    # Every write endpoint makes its permission check and its write inside one
+    # S.tx: a check before the lock acted on a stale answer (INV-05).
 
-    def get_conn() -> sqlite3.Connection:
-        conn = getattr(_conns, "conn", None)
-        if conn is None:
-            conn = S.connect(db_path)
+    @contextmanager
+    def get_conn() -> Iterator[sqlite3.Connection]:
+        # One connection per request, closed on the thread that opened it. A
+        # per-thread connection kept for reuse was never closed, and Windows
+        # cannot delete, move or purge a database file while a handle is open.
+        conn = S.connect(db_path)
+        try:
             S.init_schema(conn)
-            _conns.conn = conn
-        return conn
+            yield conn
+        finally:
+            conn.close()
 
     def get_agent(credentials: HTTPAuthorizationCredentials = Depends(bearer)) -> AgentIdentity:
         ident = token_store.resolve(credentials.credentials)
@@ -255,64 +267,54 @@ def build_app(token_store: TokenStore, db_path: Path | None = None) -> FastAPI:
 
     @app.post("/search")
     def search(req: SearchRequest, agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        # the filter runs inside the ranking: a fixed page let hidden rows
-        # crowd the caller's own record out; the post-check stays as a belt
-        hits = S.search(conn, req.query, kind=req.kind, project=req.project, limit=req.limit,
-                        visible=_predicate(agent))
-        filtered = [frame_for_model(h, dict(h)) for h in hits if _visible_to(h, agent)]
-        return {"count": len(filtered), "results": filtered, "agent": agent.name}
+        with get_conn() as conn:
+            # the filter runs inside the ranking; the post-check stays as a belt
+            hits = S.search(conn, req.query, kind=req.kind, project=req.project, limit=req.limit,
+                            visible=_predicate(agent))
+            filtered = [frame_for_model(h, dict(h)) for h in hits if _visible_to(h, agent)]
+            return {"count": len(filtered), "results": filtered, "agent": agent.name}
 
-    @app.get("/get/{slug}")
+    @app.get("/get/{slug:path}")
     def get_one(slug: str, include_history: bool = False,
                 agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        item = S.get(conn, slug)
-        if not item or not _visible_to(item, agent):
-            raise HTTPException(status_code=404, detail="not found")
-        payload = item.to_dict()
-        payload["body"] = S.load_body(item)
-        frame_for_model(item, payload)
-        payload["links_out"] = S.links_from(conn, slug)
-        # a backlink names its source: only the ones the caller could read
-        payload["links_in"] = [
-            src for src in S.links_to(conn, slug)
-            if (row := S.get(conn, src)) is not None and _visible_to(row, agent)
-        ]
-        if include_history:
-            payload["history"] = [frame_for_model({"trusted_at": None}, dict(h), fields=("old_body",), title_field="old_title")
-                                  for h in S.history(conn, slug)]
-        return payload
+        with get_conn() as conn:
+            # the visibility check and the history read see one state (INV-04)
+            record = S.read_record(conn, slug, with_history=include_history)
+            if not record or not _visible_to(record["item"], agent):
+                raise HTTPException(status_code=404, detail="not found")
+            item = record["item"]
+            payload = item.to_dict()
+            payload["body"] = record["body"]
+            payload["links_out"] = record["links_out"]
+            frame_for_model(item, payload)
+            # a backlink names its source: only the ones the caller could read
+            payload["links_in"] = [row.slug for row in record["links_in"] if _visible_to(row, agent)]
+            if include_history:
+                payload["history"] = [frame_history(h) for h in record["history"]]
+            return payload
 
     @app.post("/list")
     def list_(req: ListRequest, agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        items = S.list_items(conn, kind=req.kind, project=req.project, limit=req.limit,
-                             visible=_predicate(agent))
-        visible = [i for i in items if _visible_to(i, agent)]
-        return {
-            "count": len(visible),
-            "items": [
-                {"slug": i.slug, "kind": i.kind, "title": i.title,
-                 "project": i.project, "updated_at": i.updated_at,
-                 "visibility": i.visibility, "origin": i.origin,
-                 "trusted": bool(i.trusted_at)}
-                for i in visible
-            ],
-        }
+        with get_conn() as conn:
+            items = S.list_items(conn, kind=req.kind, project=req.project, limit=req.limit,
+                                 visible=_predicate(agent))
+            visible = [i for i in items if _visible_to(i, agent)]
+            return {
+                "count": len(visible),
+                "items": [
+                    {"slug": i.slug, "kind": i.kind, "title": frame_title(i),
+                     "project": i.project, "updated_at": i.updated_at,
+                     "visibility": i.visibility, "origin": i.origin,
+                     "trusted": bool(i.trusted_at)}
+                    for i in visible
+                ],
+            }
 
     def _gate_create(conn, item: S.MemoryItem, agent: AgentIdentity,
-                     default_visibility: str = "private") -> None:
-        """One authorization for every create path (/write, /learn).
-
-        A create that lands on an existing slug is an update in disguise: it
-        used to reach the same-hash branch of upsert, which rewrote agent and
-        visibility before any permission check — so any reader could resubmit a
-        public rule's exact text as private and own it. Existing rows keep
-        their author and visibility and demand the same permission /update does.
-        """
-        # S.get() hides soft-deleted rows, upsert does not: a tombstone's slug
-        # is still a record with an author and history, not free for anyone.
+                     default_visibility: str = "private") -> bool:
+        """One authorization for every create path (/write, /learn). A create
+        on an existing slug, a tombstone's included, is an update in disguise:
+        it keeps the row's visibility and needs the permission /update does."""
         row = conn.execute(
             "SELECT * FROM memory_items WHERE slug = ?", (item.slug,)
         ).fetchone()
@@ -320,7 +322,7 @@ def build_app(token_store: TokenStore, db_path: Path | None = None) -> FastAPI:
             if item.visibility is None:
                 item.visibility = default_visibility
             _require_visibility_perm(item.visibility, agent)
-            return
+            return True        # authorised on a free slug: the write must create
         existing = S.MemoryItem.from_row(row)
         if row["deleted_at"] is not None:
             raise HTTPException(
@@ -342,7 +344,7 @@ def build_app(token_store: TokenStore, db_path: Path | None = None) -> FastAPI:
                        "change visibility",
             )
         _require_visibility_perm(item.visibility, agent)
-        item.agent = existing.agent or agent.name
+        return False
 
     def _require_visibility_perm(visibility: str, agent: AgentIdentity) -> None:
         if visibility == "public" and not agent.can("write_public"):
@@ -353,176 +355,126 @@ def build_app(token_store: TokenStore, db_path: Path | None = None) -> FastAPI:
 
     @app.post("/write")
     def write(req: WriteRequest, agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        item = S.MemoryItem(
-            slug=req.slug, kind=req.kind, title=req.title, body=req.body,
-            project=req.project, tags=list(req.tags), topics=list(req.topics),
-            visibility=req.visibility, agent=agent.name, ttl_days=req.ttl_days,
-            origin="agent",
-        )
-        _gate_create(conn, item, agent)
-        try:
-            result = S.upsert(
-                conn, item,
-                check_conflicts=req.check_conflicts,
-                conflict_filter=_predicate(agent),
-                links=S.extract_wikilinks(req.body),
-                explicit=set(req.model_fields_set) & {"kind", "project", "tags", "topics", "ttl_days"},
-            )
-        except S.SealedRecord as exc:
-            # the owner's own record: a refusal, not a server fault
-            raise HTTPException(status_code=403, detail=str(exc))
-        except S.MemoryConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        return {"ok": True, "slug": result.slug, "id": result.id, "agent": agent.name}
+        with get_conn() as conn:
+            with S.tx(conn):
+                item = S.MemoryItem(
+                    slug=req.slug, kind=req.kind, title=req.title, body=req.body,
+                    project=req.project, tags=req.tags or [], topics=req.topics or [],
+                    visibility=req.visibility, agent=agent.name, ttl_days=req.ttl_days,
+                    origin="agent",
+                )
+                fresh = _gate_create(conn, item, agent)
+                with _refusals():
+                    result = S.upsert(
+                        conn, item, surface="http",
+                        check_conflicts=req.check_conflicts,
+                        conflict_filter=_predicate(agent),
+                        create_only=fresh,
+                        explicit=req.model_fields_set & {"kind", "project", "tags", "topics",
+                                                         "ttl_days", "visibility"},
+                    )
+                return {"ok": True, "slug": result.slug, "id": result.id, "agent": agent.name}
 
-    @app.post("/update/{slug}")
+    @app.post("/update/{slug:path}")
     def update(slug: str, req: UpdateRequest,
                agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        existing = S.get(conn, slug)
-        if not existing or not _visible_to(existing, agent):
-            raise HTTPException(status_code=404, detail="not found")
-        # Seeing a record is not permission to rewrite it. /write already gates
-        # public writes behind 'write_public'; /update used to gate on read
-        # visibility alone, so any agent could rewrite shared team memory and
-        # take over its authorship.
-        if not _may_write(existing, agent):
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "agent lacks permission to update this record "
-                    "(public requires 'write_public'; otherwise only the author or master)"
-                ),
-            )
-        original_author = existing.agent
-        existing.body = req.body
-        if req.title is not None:
-            existing.title = req.title
-        if req.kind is not None:
-            existing.kind = req.kind
-        if req.project is not None:
-            existing.project = req.project
-        if req.topics is not None:
-            existing.topics = list(req.topics)
-        if req.tags is not None:
-            existing.tags = list(req.tags)
-        # Authorship stays with whoever created the record; an editor is not an
-        # author. Only fill it in when the record never had one.
-        existing.agent = original_author or agent.name
-        # The words are now an agent's, whoever created the record: an
-        # owner-authored row rewritten over HTTP kept origin=owner, and the
-        # owner would re-trust text they never wrote.
-        existing.origin = "agent"
-        try:
-            result = S.upsert(
-                conn, existing, reason=req.reason,
-                # the surface stamps itself: `agent` is caller-supplied text
-                actor=f"http:{agent.name}",
-                links=S.extract_wikilinks(req.body),
-                explicit={k for k in ("kind", "project", "tags", "topics")
-                          if getattr(req, k) is not None},
-            )
-        except S.SealedRecord as exc:
-            # the owner's own record: a refusal, not a server fault
-            raise HTTPException(status_code=403, detail=str(exc))
-        except S.MemoryConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        return {"ok": True, "slug": result.slug}
+        with get_conn() as conn:
+            with S.tx(conn):
+                existing = S.get(conn, slug)
+                if not existing or not _visible_to(existing, agent):
+                    raise HTTPException(status_code=404, detail="not found")
+                if not _may_write(existing, agent):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            "agent lacks permission to update this record "
+                            "(public requires 'write_public'; otherwise only the author or master)"
+                        ),
+                    )
+                item = S.MemoryItem(
+                    slug=slug, body=req.body,
+                    title=(req.title or "") if "title" in req.model_fields_set else existing.title,
+                    kind=req.kind if "kind" in req.model_fields_set else existing.kind,
+                    project=req.project, topics=req.topics or [],
+                    tags=req.tags or [],
+                    origin="agent",     # the words are an agent's now
+                )
+                with _refusals():
+                    result = S.upsert(
+                        conn, item, surface="http", reason=req.reason,
+                        actor=f"http:{agent.name}",     # the surface stamps itself
+                        explicit=req.model_fields_set & {"kind", "project", "tags", "topics"},
+                    )
+                return {"ok": True, "slug": result.slug}
 
     @app.post("/learn")
     def learn(req: LearnRequest, agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        item = S.MemoryItem(
-            slug=req.slug, kind="skill", title=req.title,
-            body=S.skill_body(req.trigger, req.steps, req.outcome, req.lessons),
-            project=req.project,
-            tags=list(req.tags), topics=list(req.topics),
-            visibility=req.visibility, agent=agent.name,
-            ttl_days=req.ttl_days, origin="agent",
-        )
-        _gate_create(conn, item, agent, default_visibility="public")
-        try:
-            result = S.upsert(
-                conn, item,
-                check_conflicts=req.check_conflicts,
-                conflict_filter=_predicate(agent),
-                links=S.extract_wikilinks(item.body),
-                explicit=set(req.model_fields_set) & {"project", "tags", "topics", "ttl_days"},
-            )
-        except S.SealedRecord as exc:
-            # the owner's own record: a refusal, not a server fault
-            raise HTTPException(status_code=403, detail=str(exc))
-        except S.MemoryConflict as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        return {"ok": True, "slug": result.slug, "id": result.id, "kind": "skill", "agent": agent.name}
+        with get_conn() as conn:
+            with S.tx(conn):
+                item = S.MemoryItem(
+                    slug=req.slug, kind="skill", title=req.title,
+                    body=S.skill_body(req.trigger, req.steps, req.outcome, req.lessons),
+                    project=req.project,
+                    tags=req.tags or [], topics=req.topics or [],
+                    visibility=req.visibility, agent=agent.name,
+                    ttl_days=req.ttl_days, origin="agent",
+                )
+                fresh = _gate_create(conn, item, agent, default_visibility="public")
+                with _refusals():
+                    result = S.upsert_skill(
+                        conn, item, surface="http",
+                        check_conflicts=req.check_conflicts,
+                        conflict_filter=_predicate(agent),
+                        create_only=fresh,
+                        explicit=req.model_fields_set & {"project", "tags", "topics",
+                                                         "ttl_days", "visibility"},
+                    )
+                return {"ok": True, "slug": result.slug, "id": result.id, "kind": "skill", "agent": agent.name}
 
     @app.post("/recall")
     def recall(req: RecallRequest, agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        # Reinforce AFTER the visibility filter: bumping strength on a skill the
-        # caller may not see is both a side effect they should not be able to
-        # trigger and a covert channel into someone else's memory.
-        results = S.recall_skills(conn, req.query, limit=req.limit, auto_reinforce=False,
-                                  visible=_predicate(agent))
-        visible = [r for r in results if _visible_to(r, agent)]
-        if req.auto_reinforce:
-            locked_out = False    # a writer holds the lock: stop trying
+        with get_conn() as conn:
+            # reinforced after the visibility filter, and asked again under its lock:
+            # a skill the caller may not see is never touched
+            results = S.recall_skills(conn, req.query, limit=req.limit, auto_reinforce=False,
+                                      visible=_predicate(agent))
+            visible = [r for r in results if _visible_to(r, agent)]
+            if req.auto_reinforce:
+                bumped = S.reinforce_retrieved(conn, [r["slug"] for r in visible],
+                                               visible=_predicate(agent), surface="http")
+                for r in visible:
+                    if r["slug"] in bumped:
+                        r.update(strength=bumped[r["slug"]]["strength"],
+                                 access_count=bumped[r["slug"]]["access_count"])
             for r in visible:
-                bumped = None
-                if not locked_out:
-                    try:
-                        # 150 ms once per REQUEST, not per result: five results
-                        # behind a writer waited five times over
-                        prev_to = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-                        conn.execute("PRAGMA busy_timeout = 150")
-                        try:
-                            bumped = S.reinforce(conn, r["slug"])
-                        finally:
-                            conn.execute(f"PRAGMA busy_timeout = {int(prev_to)}")
-                    except sqlite3.OperationalError:
-                        locked_out = True    # bookkeeping never fails a read
-                if bumped:
-                    r["strength"] = bumped["strength"]
-                    r["access_count"] = bumped["access_count"]
-        for r in visible:
-            frame_for_model(r, r)
-        return {"count": len(visible), "skills": visible, "agent": agent.name}
+                frame_for_model(r, r)
+            return {"count": len(visible), "skills": visible, "agent": agent.name}
 
-    @app.post("/reinforce/{slug}")
+    @app.post("/reinforce/{slug:path}")
     def reinforce(slug: str, evidence: str = "self_report",
                   agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
-        conn = get_conn()
-        # Visibility gate: without it any agent could bump strength of skills
-        # it cannot see — a write side-channel into someone else's memory, and
-        # a slug-existence oracle (200 vs 404). Same 404 for both cases.
-        item = S.get(conn, slug)
-        if not item or not _visible_to(item, agent):
-            raise HTTPException(status_code=404, detail="not found")
-        if evidence not in S.EVIDENCE_WEIGHTS:
-            raise HTTPException(status_code=422, detail=f"unknown evidence: {evidence}")
-        result = S.reinforce(conn, slug, evidence=evidence)
-        if not result:
-            raise HTTPException(status_code=404, detail="not found")
-        return result
+        with get_conn() as conn:
+            # visibility asked inside S.reinforce, under its lock; one 404 for
+            # hidden and missing
+            if evidence not in S.EVIDENCE_WEIGHTS:
+                raise HTTPException(status_code=422, detail=f"unknown evidence: {evidence}")
+            result = S.reinforce(conn, slug, evidence=evidence, visible=_predicate(agent),
+                                 surface="http")
+            if not result:
+                raise HTTPException(status_code=404, detail="not found")
+            return result
 
     @app.post("/decay")
     def decay(days: int = Query(14, ge=1, le=3650),
               agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:
         if not agent.is_master:
             raise HTTPException(status_code=403, detail="master scope required")
-        conn = get_conn()
-        decayed = S.decay_stale(conn, days_threshold=days)
-        sweep = S.sweep_lifecycle(conn)  # same maintenance the CLI run does
-        gc = S.gc_body_files(conn)
-        return {"decayed": len(decayed), "details": decayed, "lifecycle": sweep,
-                "gc_body_files": gc}
+        with get_conn() as conn:
+            decayed = S.decay_stale(conn, days_threshold=days)
+            sweep = S.sweep_lifecycle(conn)  # same maintenance the CLI run does
+            gc = S.gc_body_files(conn)
+            return {"decayed": len(decayed), "details": decayed, "lifecycle": sweep,
+                    "gc_body_files": gc}
 
     @app.post("/reload-tokens")
     def reload_tokens(agent: AgentIdentity = Depends(get_agent)) -> dict[str, Any]:

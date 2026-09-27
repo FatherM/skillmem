@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from skillmem import storage as S
 from skillmem.cli import main as cli_main
+from tests import owner_trusts
 
 
 def _seed(conn) -> None:
@@ -20,7 +21,7 @@ def _seed(conn) -> None:
     ):
         S.upsert(conn, S.MemoryItem(slug=slug, kind=kind, title=title, body=body,
                                     origin="owner"))
-        S.set_trust(conn, slug, trusted=True)
+        owner_trusts(conn, slug, trusted=True)
 
 
 def test_briefing_empty_db(conn):

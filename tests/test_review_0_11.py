@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from skillmem import storage as S
 from skillmem import hooks as H
 from skillmem import export as E
 from skillmem.cli import main as cli_main
+from tests import owner_trusts
 
 
 @pytest.fixture
@@ -57,7 +59,7 @@ def test_write_same_text_cannot_take_over_a_record(client, home):
         "kind": "feedback", "visibility": "public"})
     assert r.status_code == 200
     conn = _conn(home)
-    S.set_trust(conn, "team-rule", trusted=True)
+    owner_trusts(conn, "team-rule", trusted=True)
     conn.commit()
     r = client.post("/write", headers=_auth("bob"), json={
         "slug": "team-rule", "title": "team rule", "body": "never force-push",
@@ -181,7 +183,7 @@ def test_force_update_keeps_earned_strength(home):
     S.upsert(conn, S.MemoryItem(slug="k", title="t", body="v2", kind="skill"), force=True)
     assert conn.execute("SELECT strength FROM memory_items WHERE slug='k'").fetchone()[0] == 1.9
     S.upsert(conn, S.MemoryItem(slug="k", title="t", body="v3", kind="skill", strength=0.4),
-             force=True, restore_strength=True)
+             force=True, explicit={"strength"})
     assert conn.execute("SELECT strength FROM memory_items WHERE slug='k'").fetchone()[0] == 0.4
 
 
@@ -190,7 +192,7 @@ def test_metadata_only_update_reindexes_tags(home):
     S.upsert(conn, S.MemoryItem(slug="k", title="deploy", body="apply", kind="skill"))
     assert not S.search(conn, "kubernetes")
     S.upsert(conn, S.MemoryItem(slug="k", title="deploy", body="apply", kind="skill",
-                                tags=["kubernetes"]))
+                                tags=["kubernetes"]), explicit={"tags"})
     assert [h["slug"] for h in S.search(conn, "kubernetes")] == ["k"]
 
 
@@ -253,7 +255,7 @@ def test_pack_import_never_overwrites_owner_rows_and_reinstalls_after_remove(hom
     conn = _conn(home)
     S.upsert(conn, S.MemoryItem(slug="pack-evil-guard", title="owner rule", body="OWNER",
                                 kind="feedback", origin="owner"))
-    S.set_trust(conn, "pack-evil-guard", trusted=True)
+    owner_trusts(conn, "pack-evil-guard", trusted=True)
     conn.commit()
     root = tmp_path / "evil"
     (root / "skills" / "guard").mkdir(parents=True)
@@ -275,6 +277,7 @@ def test_pack_import_never_overwrites_owner_rows_and_reinstalls_after_remove(hom
     assert S.get(conn, "pack-evil-other") is not None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require Windows developer mode or elevated privileges")
 def test_pack_skill_symlinks_are_ignored(tmp_path):
     from skillmem import packs as P
     root = tmp_path / "pack"

@@ -162,7 +162,7 @@ def test_dedup_ledger_lives_in_private_state_dir(tmp_path: Path,
     monkeypatch.setenv("SKILLMEM_STATE_DIR", str(tmp_path / "state" / "skillmem"))
     from skillmem import hooks as H
     p = H._dedup_file("abc-123")
-    assert str(tmp_path) in str(p) and p.name == "abc-123.txt"
+    assert str(tmp_path) in str(p) and p.name == "abc-123.jsonl"
 
 
 def test_session_recap_writes_note(db: Path, tmp_path: Path,
@@ -531,14 +531,14 @@ def test_publish_waits_for_the_lock_then_rechecks(tmp_path: Path):
     import threading
     from skillmem import hooks as H
     note = tmp_path / "session-x.md"
-    lock = note.with_name(note.name + ".publock")
-    lock.write_text("held", encoding="utf-8")   # someone else is publishing
+    lock = H._try_lock(note.with_name(note.name + ".publock"))   # someone else is publishing
+    assert lock is not None
 
     def finish_first() -> None:
         time.sleep(0.15)
         note.write_text("---\nmetadata:\n  transcript_bytes: 999999\n---\n\nFINAL\n",
                         encoding="utf-8")
-        lock.unlink()
+        lock.close()
 
     t = threading.Thread(target=finish_first)
     t.start()
@@ -565,9 +565,10 @@ def test_session_end_recap_proceeds_over_a_held_session_lock(
         return SimpleNamespace(stdout=("## DONE\n" + "x" * 150).encode(), returncode=0, stderr=b"")
 
     monkeypatch.setattr(H.subprocess, "run", fake_run)
-    lock = H._recap_stamp(payload["session_id"]).with_suffix(".lock")
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("held", encoding="utf-8")
+    path = H._recap_stamp(payload["session_id"]).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    held = H._try_lock(path)                                             # a Stop recap in flight
+    assert held is not None
     _hook(db, "session-recap", payload)                                  # Stop: skipped
     assert calls == []
     _hook(db, "session-recap", {**payload, "hook_event_name": "SessionEnd"})
@@ -585,8 +586,11 @@ def test_final_recap_over_a_held_lock_leaves_it_alone(
     monkeypatch.setattr(H.time, "sleep", lambda *_: None)
     monkeypatch.setattr(H.subprocess, "run", lambda *a, **kw: SimpleNamespace(
         stdout=("## DONE\n" + "x" * 150).encode(), returncode=0, stderr=b""))
-    lock = H._recap_stamp(payload["session_id"]).with_suffix(".lock")
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("held by a Stop recap", encoding="utf-8")
+    path = H._recap_stamp(payload["session_id"]).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    held = H._try_lock(path)                                  # held by a Stop recap
+    assert held is not None
     _hook(db, "session-recap", {**payload, "hook_event_name": "SessionEnd"})
-    assert lock.exists() and lock.read_text(encoding="utf-8") == "held by a Stop recap"
+    assert H._try_lock(path) is None, "the Stop recap's lock was taken from it"
+    held.close()
+    assert H._try_lock(path) is not None

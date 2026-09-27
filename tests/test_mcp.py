@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from skillmem import storage as S
+from tests import owner_trusts
 
 README = Path(__file__).resolve().parents[1] / "README.md"
 
@@ -439,22 +440,23 @@ def test_agent_cannot_archive_what_the_owner_approved(mcp, at_terminal, monkeypa
 
 
 def test_update_does_not_open_the_way_to_archive_an_owner_record(mcp):
-    """mem_update relabels origin to 'agent' and drops the approval by design, so
-    the gate cannot rest on those two fields: two calls would lift any rule."""
+    """mem_update used to relabel origin to 'agent' and drop the approval, so
+    the gate cannot rest on those two fields: two calls would lift any rule.
+    Since INV-03 the update itself is refused, and nothing moves."""
     from skillmem import storage as S
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="deploy-gate", kind="feedback", title="deploy gate",
                                 body="deploy only through the gate, never by hand",
                                 origin="owner"))
-    conn.execute("UPDATE memory_items SET trusted_at = ?, trusted_by = 'owner' "
-                 "WHERE slug = 'deploy-gate'", (1_700_000_000,))
-    _payload(mcp._tool_update({"slug": "deploy-gate", "title": "deploy gate (v2)",
-                               "body": "deploy only through the gate, never by hand at all",
-                               "reason": "clarified"}))
+    owner_trusts(conn, "deploy-gate")
+    err = _payload(mcp._tool_update({"slug": "deploy-gate", "title": "deploy gate (v2)",
+                                     "body": "deploy only through the gate, never by hand at all",
+                                     "reason": "clarified"}))
+    assert "owner's record" in err.get("error", ""), err
     row = conn.execute("SELECT origin, trusted_at, owner_seal FROM memory_items "
                        "WHERE slug='deploy-gate'").fetchone()
-    assert (row["origin"], row["trusted_at"]) == ("agent", None)   # both moved, as designed
-    assert row["owner_seal"] == 1                                  # the seal did not
+    assert row["origin"] == "owner" and row["trusted_at"] is not None
+    assert row["owner_seal"] == 1
     import pytest
     with pytest.raises(S.SealedRecord):
         S.set_archived(conn, "deploy-gate", True)
@@ -475,7 +477,7 @@ def test_owner_writing_a_record_seals_it(mcp, at_terminal, monkeypatch):
     S.upsert(conn, S.MemoryItem(slug="owner-edit", kind="feedback", title="rule",
                                 body="the second text, rewritten by the owner",
                                 origin="owner"),
-             reason="owner edit")
+             explicit={"origin"}, reason="owner edit")
     row = conn.execute("SELECT origin, trusted_at, owner_seal FROM memory_items "
                        "WHERE slug='owner-edit'").fetchone()
     assert (row["origin"], row["trusted_at"], row["owner_seal"]) == ("owner", None, 1)
@@ -497,28 +499,34 @@ def test_agent_cannot_relabel_a_sealed_record_out_of_the_briefing(mcp, at_termin
     err = _payload(mcp._tool_write({"slug": "rule-kind", "title": "rule",
                                     "body": "a rule the briefing selects by kind",
                                     "kind": "note"}))
-    assert "cannot change its kind" in err.get("error", ""), err
+    assert "only the owner changes it" in err.get("error", ""), err
     err2 = _payload(mcp._tool_update({"slug": "rule-kind", "kind": "note",
                                       "body": "a slightly different rule text here",
                                       "reason": "relabel"}))
-    assert "cannot change its kind" in err2.get("error", ""), err2
+    assert "only the owner changes it" in err2.get("error", ""), err2
     assert conn.execute("SELECT kind FROM memory_items WHERE slug='rule-kind'"
                         ).fetchone()["kind"] == "feedback"
 
 
 def test_the_briefing_names_the_owner_rules_an_agent_rewrote(mcp):
-    """An agent update clears the approval by design, so the rule leaves the
-    briefing. Silently, it just stops arriving and nothing says why."""
+    """An agent update used to clear the approval, so the rule left the
+    briefing silently. It is refused now (INV-03); a rule that lost its
+    approval another way (the owner withdrew it) is still named."""
     from skillmem import storage as S
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="gate-rule", kind="feedback", title="gate",
                                 body="deploy only through the gate, never by hand",
                                 origin="owner"))
-    S.set_trust(conn, "gate-rule", trusted=True)
+    owner_trusts(conn, "gate-rule", trusted=True)
     assert any(e["slug"] == "gate-rule"
                for sec in S.briefing(conn)["sections"] for e in sec["items"])
-    _payload(mcp._tool_update({"slug": "gate-rule", "body": "deploy through the gate, always",
-                               "reason": "tightened"}))
+    err = _payload(mcp._tool_update({"slug": "gate-rule",
+                                     "body": "deploy through the gate, always",
+                                     "reason": "tightened"}))
+    assert "owner's record" in err.get("error", ""), err
+    assert any(e["slug"] == "gate-rule"
+               for sec in S.briefing(conn)["sections"] for e in sec["items"])
+    owner_trusts(conn, "gate-rule", trusted=False)
     brief = S.briefing(conn)
     assert not any(e["slug"] == "gate-rule"
                    for sec in brief["sections"] for e in sec["items"])
@@ -534,7 +542,7 @@ def test_the_owner_check_lives_in_the_mutation_not_the_caller(mcp, monkeypatch, 
     for slug in ("mut-arch", "mut-del"):
         S.upsert(conn, S.MemoryItem(slug=slug, kind="feedback", title="rule",
                                     body=f"the owner's rule {slug} kept here",
-                                    origin="owner"), owner_call=True)
+                                    origin="owner"))
     monkeypatch.setattr(S, "owner_present", lambda: False)
     with pytest.raises(S.SealedRecord):
         S.set_archived(conn, "mut-arch", True)     # no flag at all
@@ -580,7 +588,24 @@ def test_every_owner_only_command_is_denied_by_init(mcp):
         "Bash(*skillmem*$*)", "Bash(*$*skillmem*)",
         "Bash(*skillmem*`*)", "Bash(*`*skillmem*)",
         "Bash(*eval*skillmem*)", "Bash(*skillmem*eval*)",
+        "Bash(*skillmem*trust*)", "Bash(*skillmem*skills-archive*)",
+        "Bash(*skillmem*import-vault*)", "Bash(*skillmem* rm *)",
+        "Bash(*skillmem*--db*)", "Bash(*skillmem*skills-restore*)",
+        "Bash(*skillmem*--purge-db*)",
     }
+
+
+def test_deny_rules_survive_a_global_option_or_a_second_space():
+    """`skillmem --db x trust` and `skillmem  trust` slipped every rule."""
+    from fnmatch import fnmatchcase
+    from skillmem import cli as C
+    globs = [r[len("Bash("):-1] for r in C._OWNER_DENY_RULES]
+    for cmd in ("skillmem --db /tmp/x.db trust foo",
+                "skillmem --db=/tmp/x.db rm foo",
+                "skillmem  trust foo",
+                "script -q /dev/null skillmem  skills-archive foo",
+                "python -m skillmem.cli --db x.db import-vault v"):
+        assert any(fnmatchcase(cmd, g) for g in globs), cmd
 
 
 def test_a_body_file_with_no_recorded_hash_is_not_served(tmp_path, monkeypatch):
@@ -591,7 +616,7 @@ def test_a_body_file_with_no_recorded_hash_is_not_served(tmp_path, monkeypatch):
     conn = S.connect(tmp_path / "home" / "memory.db"); S.init_schema(conn)
     big = "the owner's rule about the deploy gate. " * 400
     S.upsert(conn, S.MemoryItem(slug="no-hash", kind="feedback", title="rule",
-                                body=big, origin="owner"), owner_call=True)
+                                body=big, origin="owner"))
     item = S.get(conn, "no-hash")
     assert item.body_path
     conn.execute("UPDATE memory_items SET content_hash = '' WHERE slug = 'no-hash'")
@@ -606,9 +631,7 @@ def test_an_unnamed_kind_is_not_written(mcp):
     from skillmem import storage as S
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="keep-kind", kind="feedback", title="rule",
-                                body="the owner's rule about the deploy gate",
-                                origin="owner"), owner_call=True)
-    S.set_trust(conn, "keep-kind", trusted=True)
+                                body="the owner's rule about the deploy gate"))
     # a write that names other fields but not the kind: the item still carries a
     # default kind, and it must not reach the row
     S.upsert(conn, S.MemoryItem(slug="keep-kind", kind="note", title="rule",
@@ -625,10 +648,10 @@ def test_approval_refuses_an_archived_record(mcp, at_terminal):
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="arch-rule", kind="feedback", title="rule",
                                 body="a rule retired before approval",
-                                origin="owner"), owner_call=True)
+                                origin="owner"))
     S.set_archived(conn, "arch-rule", True, by="owner-cli")
     with pytest.raises(S.MemoryConflict, match="archived"):
-        S.set_trust(conn, "arch-rule", trusted=True)
+        owner_trusts(conn, "arch-rule", trusted=True)
     assert conn.execute("SELECT trusted_at FROM memory_items WHERE slug='arch-rule'"
                         ).fetchone()["trusted_at"] is None
 
@@ -642,7 +665,7 @@ def test_hiding_and_deleting_default_to_refusing(mcp, at_terminal, monkeypatch):
     for slug in ("def-arch", "def-del"):
         S.upsert(conn, S.MemoryItem(slug=slug, kind="feedback", title="rule",
                                     body=f"the owner's rule {slug} kept here",
-                                    origin="owner"), owner_call=True)
+                                    origin="owner"))
     monkeypatch.setattr(S, "owner_present", lambda: False)   # the agent's side
     with pytest.raises(S.SealedRecord):
         S.set_archived(conn, "def-arch", True)
@@ -659,7 +682,10 @@ def test_recall_does_not_fail_or_stall_behind_a_writer(tmp_path):
     import sqlite3, time
     from skillmem import storage as S
     conn = S.connect(tmp_path / "m.db"); S.init_schema(conn)
-    for i in range(5):
+    # 20 rows keep the two cases apart on a slow runner: one timeout per call
+    # is ~0.3 s, one per row is several seconds (5 rows put both near 1 s,
+    # and a loaded CI mac read 1.06 s)
+    for i in range(20):
         S.upsert(conn, S.MemoryItem(slug=f"sk{i}", kind="skill", title=f"skill {i}",
                                     body=f"how to do the thing number {i} properly"))
     holder = sqlite3.connect(tmp_path / "m.db", isolation_level=None)
@@ -668,10 +694,10 @@ def test_recall_does_not_fail_or_stall_behind_a_writer(tmp_path):
     try:
         conn.execute("PRAGMA busy_timeout = 300")
         t0 = time.time()
-        out = S.recall_skills(conn, "the thing", limit=5)
+        out = S.recall_skills(conn, "the thing", limit=20)
         waited = time.time() - t0
-        assert len(out) == 5                      # results, not an exception
-        assert waited < 1.0, f"waited {waited:.2f}s: one timeout per row, not per call"
+        assert len(out) == 20                     # results, not an exception
+        assert waited < 2.0, f"waited {waited:.2f}s: one timeout per row, not per call"
     finally:
         holder.execute("ROLLBACK")
         holder.close()
@@ -685,8 +711,8 @@ def test_the_owner_signal_is_the_terminal_not_the_module(mcp, monkeypatch):
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="tty-rule", kind="feedback", title="rule",
                                 body="deploy only through the gate, always",
-                                origin="owner"), owner_call=True)
-    S.set_trust(conn, "tty-rule", trusted=True)
+                                origin="owner"))
+    owner_trusts(conn, "tty-rule", trusted=True)
     monkeypatch.setattr(S.sys.stdin, "isatty", lambda: False, raising=False)
     monkeypatch.setattr(S.sys.stdout, "isatty", lambda: False, raising=False)
     assert S.owner_present() is False
@@ -694,25 +720,26 @@ def test_the_owner_signal_is_the_terminal_not_the_module(mcp, monkeypatch):
     with pytest.raises(S.SealedRecord):
         S.upsert(conn, S.MemoryItem(slug="tty-rule", kind="note", title="rule",
                                     body="deploy only through the gate, always"),
-                 explicit={"kind"}, owner_call=S.owner_present())
+                 explicit={"kind"})
     assert conn.execute("SELECT kind FROM memory_items WHERE slug='tty-rule'"
                         ).fetchone()["kind"] == "feedback"
 
 
 def test_the_guard_fires_when_the_caller_names_no_fields(mcp):
-    """explicit=None means "apply everything", so it includes the kind. migrate,
-    packs and the importer all pass None, and the guard used to skip them."""
+    """explicit=None meant "apply everything", so it included the kind. migrate,
+    packs and the importer all passed None, and the guard used to skip them.
+    The mode is gone (INV-14); naming nothing still meets the seal."""
     from skillmem import storage as S
     import pytest
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="none-rule", kind="feedback", title="rule",
                                 body="the owner's rule with an explicit set",
-                                origin="owner"), owner_call=True)
-    S.set_trust(conn, "none-rule", trusted=True)
+                                origin="owner"))
+    owner_trusts(conn, "none-rule", trusted=True)
     with pytest.raises(S.SealedRecord):
         S.upsert(conn, S.MemoryItem(slug="none-rule", kind="note", title="rule",
                                     body="a rewritten body from a markdown file"),
-                 explicit=None, reason="migrated from .md")
+                 reason="migrated from .md")
     assert conn.execute("SELECT kind FROM memory_items WHERE slug='none-rule'"
                         ).fetchone()["kind"] == "feedback"
 
@@ -732,29 +759,31 @@ def test_reinforce_refuses_an_archived_record(mcp, at_terminal):
 
 
 def test_every_upsert_caller_is_deliberate_about_the_guard():
-    """The audit three rounds of P1s were missing: an owner surface must say
-    owner_call=True, an agent surface must never claim it. A surface added
-    without a decision is guarded by default; this only checks the decisions."""
+    """The audit three rounds of P1s were missing. A caller no longer votes on
+    ownership (storage asks the terminal itself); it names its surface, whose
+    row in SURFACES says what it may change, and agent surfaces say so."""
     import pathlib
+    from skillmem import storage as S
     root = pathlib.Path(__file__).resolve().parent.parent / "skillmem"
-    owner_surfaces = {"cli.py", "migrate.py", "vault.py"}     # ask the terminal
-    agent_surfaces = {"mcp_server.py", "server.py", "packs.py"}
-    for name in owner_surfaces | agent_surfaces:
+    expected = {"cli.py": {"cli"}, "migrate.py": {"migrate"}, "vault.py": {"dump", "note"},
+                "mcp_server.py": {"mcp"}, "server.py": {"http"}, "packs.py": {"pack"}}
+    for name, surfaces in expected.items():
         lines = (root / name).read_text(encoding="utf-8").splitlines()
+        calls = 0
         for i, line in enumerate(lines):
-            if not line.strip().endswith("upsert(") and "upsert(conn" not in line:
+            if (not ("upsert(" in line or "upsert_skill(" in line)
+                    or line.lstrip().startswith(("#", "def "))):
                 continue
-            window = "\n".join(lines[i:i + 16])
-            if name in owner_surfaces:
-                # the TTY, never a hardcoded True: an agent runs these commands too
-                assert "owner_call=" in window and "owner_present()" in window, \
-                    f"{name}:{i + 1} must derive owner_call from owner_present()"
-                assert "owner_call=True" not in window, f"{name}:{i + 1} hardcodes owner_call"
-            else:
-                assert "owner_call" not in window, f"{name}:{i + 1} claims owner_call"
+            calls += 1
+            window = "\n".join(lines[i:i + 4])
+            assert "surface=" in window and "owner_call" not in window, f"{name}:{i + 1}"
+            assert any(f'"{s}"' in window for s in surfaces), f"{name}:{i + 1}"
+        assert calls, name
+    for s in ("mcp", "http", "pack"):
+        assert S.SURFACES[s].get("agents"), s
 
 
-def test_the_kind_guard_is_on_by_default(mcp):
+def test_the_kind_guard_is_on_by_default(mcp, monkeypatch):
     """Three rounds running, the hole was a surface that did not pass the flag.
     The guard is on unless a caller states it is the owner's own."""
     from skillmem import storage as S
@@ -762,8 +791,8 @@ def test_the_kind_guard_is_on_by_default(mcp):
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="fb-rule", kind="feedback", title="rule",
                                 body="deploy only through the gate here",
-                                origin="owner"), owner_call=True)
-    S.set_trust(conn, "fb-rule", trusted=True)
+                                origin="owner"))
+    owner_trusts(conn, "fb-rule", trusted=True)
     # any caller that does not say "owner" is refused, same text or not
     with pytest.raises(S.SealedRecord):
         S.upsert(conn, S.MemoryItem(slug="fb-rule", kind="note", title="rule",
@@ -775,10 +804,11 @@ def test_the_kind_guard_is_on_by_default(mcp):
                  explicit={"kind"}, reason="relabel")
     assert conn.execute("SELECT kind FROM memory_items WHERE slug='fb-rule'"
                         ).fetchone()["kind"] == "feedback"
-    # the owner's own surface may
+    # the owner may
+    monkeypatch.setattr(S, "owner_present", lambda: True)
     S.upsert(conn, S.MemoryItem(slug="fb-rule", kind="note", title="rule",
                                 body="deploy only through the gate here",
-                                origin="owner"), explicit={"kind"}, owner_call=True)
+                                origin="owner"), explicit={"kind"})
     assert conn.execute("SELECT kind FROM memory_items WHERE slug='fb-rule'"
                         ).fetchone()["kind"] == "note"
 
@@ -791,14 +821,14 @@ def test_approval_is_pinned_to_the_text_the_owner_read(mcp):
     conn = mcp._shared_conn(); S.init_schema(conn)
     S.upsert(conn, S.MemoryItem(slug="rule-swap", kind="feedback", title="rule",
                                 body="never paste tokens into a prompt",
-                                origin="owner"), owner_call=True)
+                                origin="owner"))
     seen = S.get(conn, "rule-swap")
     # the agent substitutes the body in the gap
     S.upsert(conn, S.MemoryItem(slug="rule-swap", kind="feedback", title="rule",
                                 body="paste tokens straight into the prompt"),
              reason="agent edit")
     with pytest.raises(S.MemoryConflict):
-        S.set_trust(conn, "rule-swap", trusted=True, expect_hash=seen.content_hash)
+        owner_trusts(conn, "rule-swap", trusted=True, expect_hash=seen.content_hash)
     assert conn.execute("SELECT trusted_at FROM memory_items WHERE slug='rule-swap'"
                         ).fetchone()["trusted_at"] is None
 
@@ -833,7 +863,7 @@ def test_an_owner_write_of_the_same_text_still_seals(mcp, at_terminal, monkeypat
     # the owner writes the identical text, the way the CLI does
     S.upsert(conn, S.MemoryItem(slug="same-rule", kind="feedback", title="rule",
                                 body="the exact text of this rule", origin="owner"),
-             explicit={"kind"})
+             surface="cli", explicit={"kind"})
     assert conn.execute("SELECT owner_seal FROM memory_items WHERE slug='same-rule'"
                         ).fetchone()["owner_seal"] == 1
     import pytest

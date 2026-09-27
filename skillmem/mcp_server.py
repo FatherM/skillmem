@@ -1,4 +1,4 @@
-"""MCP stdio server exposing skillmem as 10 tools.
+"""MCP stdio server exposing skillmem as 9 tools.
 
 Tools:
     mem_search    — hybrid full-text search (FTS5 BM25 + optional vector recall)
@@ -20,7 +20,6 @@ import asyncio
 import json
 import os
 import re
-from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
@@ -35,25 +34,14 @@ from . import storage as S
 SERVER_NAME = "skillmem"
 
 
-def _db_path() -> Path:
-    return S.default_db_path()  # honours SKILLMEM_DB, then SKILLMEM_HOME
-
-
-
 _CONN: "sqlite3.Connection | None" = None
 
 
 def _shared_conn() -> "sqlite3.Connection":
-    """One connection for the life of the stdio server.
-
-    Each tool call used to open its own connection and drop it on the floor;
-    over a long session that is a pile of WAL readers held open by refcount
-    alone. The MCP server is a single process serving one client, so a single
-    cached connection is both correct and cheaper.
-    """
+    """One connection for the life of the stdio server (one process, one client)."""
     global _CONN
     if _CONN is None:
-        _CONN = S.connect(_db_path())
+        _CONN = S.connect(S.default_db_path())
         S.init_schema(_CONN)
     return _CONN
 
@@ -61,8 +49,13 @@ def _ok(payload: Any) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
 
 
+class _Err(list):
+    """A tool failure. Returned as plain content, the SDK sent it with
+    isError: false — a missing record looked like a successful call."""
+
+
 def _err(message: str) -> list[TextContent]:
-    return [TextContent(type="text", text=json.dumps({"error": message}, ensure_ascii=False))]
+    return _Err([TextContent(type="text", text=json.dumps({"error": message}, ensure_ascii=False))])
 
 
 # --------------------------------------------------------------------------- #
@@ -85,7 +78,6 @@ def _tool_search(args: dict[str, Any]) -> list[TextContent]:
     if not query:
         return _err("query is required")
     conn = _shared_conn()
-    S.init_schema(conn)
     hits = S.search(
         conn,
         query,
@@ -103,8 +95,6 @@ def _tool_search(args: dict[str, Any]) -> list[TextContent]:
             "rank": h["rank"],
             "snippet": h.get("snippet"),
             "updated_at": h["updated_at"],
-            # Provenance travels with every row: an unapproved memory is data the
-            # caller must not follow as an instruction.
             "origin": h.get("origin") or "unknown",
         })
         for h in hits
@@ -116,36 +106,33 @@ def _tool_get(args: dict[str, Any]) -> list[TextContent]:
     slug = args.get("slug")
     if not slug:
         return _err("slug is required")
-    conn = _shared_conn()
-    S.init_schema(conn)
-    item = S.get(conn, slug)
-    if not item:
+    record = S.read_record(_shared_conn(), slug,
+                           with_history=bool(args.get("include_history")))
+    if not record:
         return _err(f"not found: {slug}")
-    from .hooks import frame_for_model
+    from .hooks import frame_for_model, frame_history
+    item = record["item"]
     payload = item.to_dict()
-    payload["body"] = S.load_body(item)  # materialize external bodies
-    frame_for_model(item, payload)  # unapproved → title+body inside the frame
-    payload["links_out"] = S.links_from(conn, slug)
-    payload["links_in"] = S.links_to(conn, slug)
+    payload["body"] = record["body"]  # materialize external bodies
+    payload["links_out"] = record["links_out"]
+    frame_for_model(item, payload)  # unapproved → title, body, links inside the frame
+    payload["links_in"] = [row.slug for row in record["links_in"]]
     if args.get("include_history"):
-        # a previous version is text nobody approved (approval belongs to
-        # the current words), so history is framed whatever the row's state
-        payload["history"] = [frame_for_model({"trusted_at": None}, dict(h), fields=("old_body",), title_field="old_title")
-                              for h in S.history(conn, slug)]
+        payload["history"] = [frame_history(h) for h in record["history"]]
     return _ok(payload)
 
 
 def _tool_list(args: dict[str, Any]) -> list[TextContent]:
     conn = _shared_conn()
-    S.init_schema(conn)
     items = S.list_items(
         conn,
         kind=args.get("kind") or None,
         project=args.get("project") or None,
         limit=_limit(args, 50),
     )
+    from .hooks import frame_title
     summary = [
-        {"slug": i.slug, "kind": i.kind, "title": i.title,
+        {"slug": i.slug, "kind": i.kind, "title": frame_title(i),
          "project": i.project, "updated_at": i.updated_at,
          "origin": i.origin, "trusted": bool(i.trusted_at)}
         for i in items
@@ -173,39 +160,43 @@ def _agent() -> str:
     return _normalize_agent(_ENV_AGENT or _client_agent or "claude-code")
 
 
-def _tool_write(args: dict[str, Any]) -> list[TextContent]:
-    required = ("slug", "title", "body")
+def _named(args: dict[str, Any], fields: tuple[str, ...]) -> set[str]:
+    """The fields the client sent. A key present names its field, and a JSON
+    null clears it, as over HTTP; an absent key leaves the row's value."""
+    return {k for k in fields if k in args}
+
+
+def _missing(args: dict[str, Any], required: tuple[str, ...]) -> list[TextContent] | None:
+    """Presence is required; an empty string is a value, as it is over HTTP."""
     for r in required:
-        if not args.get(r):
+        if args.get(r) is None:
             return _err(f"{r} is required")
+    return None
+
+
+def _tool_write(args: dict[str, Any]) -> list[TextContent]:
+    if (err := _missing(args, ("slug", "title", "body"))) is not None:
+        return err
 
     conn = _shared_conn()
-    S.init_schema(conn)
     item = S.MemoryItem(
-        # An agent wrote this mid-session, so it is never trusted on arrival:
-        # the document it was reading could have asked for exactly this.
         origin="agent",
         slug=args["slug"],
-        kind=args.get("kind") or "note",
+        kind=args.get("kind", "note"),
         title=args["title"],
         body=args["body"],
         project=args.get("project"),
-        # Agent identity is set server-side — clients can't forge authorship.
-        agent=_agent(),
-        tags=list(args.get("tags") or []),
-        topics=list(args.get("topics") or []),
+        agent=_agent(),     # set server-side: a client cannot forge authorship
+        tags=args.get("tags") or [],
+        topics=args.get("topics") or [],
         ttl_days=args.get("ttl_days"),
     )
     try:
         result = S.upsert(
-            conn, item,
+            conn, item, surface="mcp",
             check_conflicts=bool(args.get("check_conflicts", True)),
-            links=S.extract_wikilinks(item.body),
-            # only what the client actually sent may change an existing row
-            # a JSON null is "not sent"; an empty list for tags/topics is a real clear
             actor=f"mcp:{_agent()}",
-            explicit={k for k in ("kind", "project", "tags", "topics", "ttl_days")
-                      if args.get(k) is not None},
+            explicit=_named(args, ("kind", "project", "tags", "topics", "ttl_days")),
         )
     except (S.MemoryConflict, S.SealedRecord, ValueError) as exc:
         return _err(str(exc))
@@ -213,52 +204,42 @@ def _tool_write(args: dict[str, Any]) -> list[TextContent]:
 
 
 def _tool_update(args: dict[str, Any]) -> list[TextContent]:
-    slug = args.get("slug")
-    body = args.get("body")
-    reason = args.get("reason")
-    if not (slug and body and reason):
-        return _err("slug, body, and reason are required")
+    if (err := _missing(args, ("slug", "body"))) is not None:
+        return err
+    slug, body, reason = args["slug"], args["body"], args.get("reason")
+    if not reason:
+        return _err("reason is required")
     conn = _shared_conn()
-    S.init_schema(conn)
-    existing = S.get(conn, slug)
-    if not existing:
-        return _err(f"not found: {slug}")
-
-    existing.body = body
-    if args.get("title"):
-        existing.title = args["title"]
-    if args.get("kind"):
-        existing.kind = args["kind"]
-    if args.get("project") is not None:
-        existing.project = args["project"]
-    existing.agent = _agent()
-    existing.origin = "agent"          # the words are the agent's now, whoever wrote v1
-    if args.get("tags") is not None:
-        existing.tags = list(args["tags"])
-    if args.get("topics") is not None:
-        existing.topics = list(args["topics"])
-
-    try:
-        result = S.upsert(
-            conn, existing, reason=reason,
-            links=S.extract_wikilinks(body),
-            actor=f"mcp:{_agent()}",
-            explicit={k for k in ("kind", "project", "tags", "topics") if args.get(k) is not None},
+    # the existence check and the write in one transaction; a title the client
+    # did not send is the one this lock reads
+    with S.tx(conn):
+        existing = S.get(conn, slug)
+        if not existing:
+            return _err(f"not found: {slug}")
+        item = S.MemoryItem(
+            slug=slug, body=body, origin="agent",   # the words are the agent's now
+            title=(args["title"] or "") if "title" in args else existing.title,
+            kind=args.get("kind", existing.kind), project=args.get("project"),
+            tags=args.get("tags") or [], topics=args.get("topics") or [],
+            agent=_agent(),
         )
-    except (S.MemoryConflict, S.SealedRecord, ValueError) as exc:
-        return _err(str(exc))
+        try:
+            result = S.upsert(
+                conn, item, surface="mcp", reason=reason,
+                actor=f"mcp:{_agent()}",
+                explicit=_named(args, ("kind", "project", "tags", "topics")),
+            )
+        except (S.MemoryConflict, S.SealedRecord, ValueError) as exc:
+            return _err(str(exc))
     return _ok({"ok": True, "slug": result.slug, "history_entries": len(S.history(conn, slug))})
 
 
 def _tool_learn(args: dict[str, Any]) -> list[TextContent]:
     """Record an after-action skill from task experience."""
-    required = ("slug", "title", "trigger", "steps", "outcome")
-    for r in required:
-        if not args.get(r):
-            return _err(f"{r} is required")
+    if (err := _missing(args, ("slug", "title", "trigger", "steps", "outcome"))) is not None:
+        return err
 
     conn = _shared_conn()
-    S.init_schema(conn)
     item = S.MemoryItem(
         origin="agent",
         slug=args["slug"],
@@ -268,31 +249,21 @@ def _tool_learn(args: dict[str, Any]) -> list[TextContent]:
                           args.get("lessons")),
         project=args.get("project"),
         agent=_agent(),
-        tags=list(args.get("tags") or []),
-        topics=list(args.get("topics") or []),
-        visibility=args.get("visibility") or "public",
+        tags=args.get("tags") or [],
+        topics=args.get("topics") or [],
+        visibility=args.get("visibility", "public"),
         ttl_days=args.get("ttl_days"),
     )
-    # the slug may already hold a note: check before writing, or a refused
-    # call still lands its tags and topics on somebody else's record
-    existing = S.get(conn, item.slug)
-    if existing and existing.kind != "skill":
-        return _err(f"slug '{item.slug}' already holds a {existing.kind}; "
-                    f"pick another slug or use mem_update")
     try:
-        result = S.upsert(
-            conn, item,
+        result = S.upsert_skill(
+            conn, item, surface="mcp",
             check_conflicts=bool(args.get("check_conflicts", True)),
-            links=S.extract_wikilinks(item.body),
             actor=f"mcp:{_agent()}",
-            explicit={k for k in ("visibility", "project", "tags", "topics", "ttl_days")
-                      if args.get(k) is not None},
+            explicit=_named(args, ("visibility", "project", "tags", "topics", "ttl_days")),
         )
     except (S.MemoryConflict, S.SealedRecord, ValueError) as exc:
         return _err(str(exc))
-    stored = S.get(conn, result.slug)
-    return _ok({"ok": True, "slug": result.slug, "id": result.id,
-                "kind": stored.kind if stored else "skill"})
+    return _ok({"ok": True, "slug": result.slug, "id": result.id, "kind": result.kind})
 
 
 def _tool_recall(args: dict[str, Any]) -> list[TextContent]:
@@ -301,14 +272,11 @@ def _tool_recall(args: dict[str, Any]) -> list[TextContent]:
     if not query:
         return _err("query is required")
     conn = _shared_conn()
-    S.init_schema(conn)
     results = S.recall_skills(
         conn, query,
         limit=_limit(args, 5, cap=50),
         auto_reinforce=bool(args.get("auto_reinforce", True)),
     )
-    # A skill body is read as guidance, so an unapproved one — anything an agent
-    # stored or a pack brought in — travels inside the same frame the hooks use.
     from .hooks import frame_for_model
     for r in results:
         frame_for_model(r, r)
@@ -333,8 +301,7 @@ def _tool_reinforce(args: dict[str, Any]) -> list[TextContent]:
         return _err(f"unknown evidence: {evidence}; expected one of "
                     f"{', '.join(sorted(S.EVIDENCE_WEIGHTS))}")
     conn = _shared_conn()
-    S.init_schema(conn)
-    result = S.reinforce(conn, slug, evidence=evidence)
+    result = S.reinforce(conn, slug, evidence=evidence, surface="mcp")
     if not result:
         return _err(f"not found, or not a skill: {slug}")
     return _ok(result)
@@ -346,8 +313,10 @@ def _tool_pin(args: dict[str, Any]) -> list[TextContent]:
     if not slug:
         return _err("slug is required")
     conn = _shared_conn()
-    S.init_schema(conn)
-    result = S.set_pinned(conn, slug, bool(args.get("pinned", True)))
+    try:
+        result = S.set_pinned(conn, slug, bool(args.get("pinned", True)), surface="mcp")
+    except S.SealedRecord as exc:
+        return _err(str(exc))
     if not result:
         return _err(f"not found: {slug}")
     return _ok(result)
@@ -438,8 +407,8 @@ TOOLS: list[Tool] = [
             "different text is refused (use mem_update with a reason); byte-identical "
             "text is returned unchanged and keeps its approval. `check_conflicts` "
             "(default true) refuses a near-duplicate and names the overlapping "
-            "records — pass false only deliberately. `ttl_days` sets an expiry; it "
-            "cannot be cleared here. Returns ok, slug and id. Use mem_learn for a "
+            "records — pass false only deliberately. `ttl_days` sets an expiry; on an "
+            "existing record a field sent as null clears it. Returns ok, slug and id. Use mem_learn for a "
             "procedure learned by doing; mem_update to change text."
         ),
         inputSchema={
@@ -467,9 +436,11 @@ TOOLS: list[Tool] = [
             "history under the required `reason`, marks the text origin='agent' and "
             "DROPS the owner's approval — approval belongs to the words that were "
             "approved. Same text with new metadata changes only the metadata and "
-            "keeps approval. Fields omitted stay as they were; `ttl_days` cannot be "
-            "changed here. Fails for an unknown or deleted slug (create with "
-            "mem_write). Returns ok, slug and the history length. Use mem_reinforce "
+            "keeps approval. Fields omitted stay as they were, a field sent as null "
+            "is cleared; `ttl_days` cannot be changed here. Fails for an unknown or "
+            "deleted slug (create with mem_write), an archived one, and a record the "
+            "owner wrote or approved (only the owner changes it; write a proposal "
+            "under a new slug). Returns ok, slug and the history length. Use mem_reinforce "
             "to report how a skill worked instead of editing it; retiring a record "
             "retire a record without editing."
         ),
@@ -479,7 +450,7 @@ TOOLS: list[Tool] = [
                 "slug": {"type": "string"},
                 "body": {"type": "string"},
                 "reason": {"type": "string", "description": "Why this update was made."},
-                "title": {"type": "string"},
+                "title": {"type": ["string", "null"]},
                 "kind": {"type": "string"},
                 "project": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
@@ -594,7 +565,8 @@ TOOLS: list[Tool] = [
             "because it is rarely needed — a deploy gate, a safety constraint — where "
             "decay would read rarity as irrelevance. A pinned record cannot be "
             "archived until unpinned; unpinning does not un-archive it, and pinning an "
-            "archived record leaves it archived. Fails for "
+            "archived record leaves it archived. Only the owner changes the pin of a "
+            "record they wrote or approved. Fails for "
             "an unknown slug. Returns the slug, the pinned state, whether the flag "
             "changed, and the record's current lifecycle. "
             "Use mem_reinforce for skills that should earn their "
@@ -613,6 +585,15 @@ TOOLS: list[Tool] = [
         },
     ),
 ]
+
+# The SDK validates arguments against inputSchema before a handler runs, so a
+# field a JSON null clears (_named) has to accept null there: typed plainly,
+# the promised clear was an input validation error (INV-14, C6).
+for _tool in TOOLS:
+    for _key in ("project", "tags", "topics", "ttl_days"):
+        if _key in _tool.inputSchema["properties"]:
+            _tool.inputSchema["properties"][_key]["type"] = [
+                _tool.inputSchema["properties"][_key]["type"], "null"]
 
 
 TOOL_HANDLERS = {
@@ -652,9 +633,7 @@ def _remember_client(server: Server) -> None:
 
 
 def _build_server() -> Server:
-    # Report our own version, not the SDK's: a registry listing and a client's
-    # debug output both read serverInfo, and "1.30.0" (the mcp library) told
-    # anyone looking a version this package has never had.
+    # serverInfo carries our version, not the SDK's
     from . import __version__ as _our_version
     server: Server = Server(SERVER_NAME, version=_our_version)
 
@@ -666,9 +645,11 @@ def _build_server() -> Server:
     async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         _remember_client(server)
         handler = TOOL_HANDLERS.get(name)
-        if handler is None:
-            return _err(f"unknown tool: {name}")
-        return handler(arguments or {})
+        out = handler(arguments or {}) if handler else _err(f"unknown tool: {name}")
+        if isinstance(out, _Err):
+            # the SDK turns a raised exception into isError: true, same text
+            raise RuntimeError(out[0].text)
+        return out
 
     return server
 

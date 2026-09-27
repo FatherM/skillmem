@@ -31,6 +31,13 @@
           { "type": "command", "command": "skillmem hook session-recap", "timeout": 95 }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "skillmem hook session-recap", "timeout": 60 }
+        ]
+      }
     ]
   }
 }

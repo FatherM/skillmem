@@ -1,0 +1,14 @@
+# id|prompt|expected answer (regex, case-insensitive) — the regex is LAST so it may contain |
+#
+# Read-only questions whose answer lives in the memory database and would
+# otherwise take digging. These six are illustrative placeholders: they will
+# not match your corpus. Replace them with six from your own work — the
+# thing you keep re-explaining to the agent, phrased the way you would ask.
+# No secrets, hostnames or addresses in prompts or answers: results files
+# are plain text and this file is public.
+t1|Which port does our internal dashboard listen on, and does its service come back after a reboot? One line.|8080
+t2|Which script must restart the app service instead of a bare systemctl restart, and why that one? One line.|restart_app
+t3|Which model is the fallback when the primary model returns 503, and why not the older one? One line.|fallback-model
+t4|What must be set before running pytest in the second checkout, or the tests check the wrong tree? One line.|base_dir
+t5|Which script is the only allowed way to deploy to production? One line.|deploy\.sh
+t6|Where does skillmem write its hook log on macOS? One line.|hooks\.log

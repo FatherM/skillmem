@@ -154,7 +154,7 @@ if ($userPath -notlike "*$BinDir*") {
 $VSkillMem = Join-Path $PkgDir ".venv\Scripts\skillmem.exe"
 if (-not $NoSemantic) {
     Say "Downloading embedding model (~220 MB, one time — otherwise the first search appears to hang)"
-    & $VPython -c "import sys; from skillmem import embed; sys.exit(0 if embed.available() else 1)" 2>$null
+    & $VPython -c "import sys; from skillmem import embed; sys.exit(0 if embed.allow_download() or embed.available() else 1)" 2>$null
     if ($LASTEXITCODE -eq 0) { Say "Semantic recall ready" }
     else { Warn "model download failed — recall will use BM25 until it succeeds" }
 }

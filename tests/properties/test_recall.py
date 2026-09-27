@@ -5,6 +5,9 @@ corpora and found, in the code they replaced, 19% of prompts carrying fewer
 records than v0.11.1 and 22% carrying a duplicate. Those probes lived in a
 scratch directory. They live here now, seeded and sized to run in seconds,
 so the next change to this path is measured before it is argued about.
+
+With them, the budget as an upper bound at its edges. These guard invariants,
+not one regression, so release gate check 5 does not run them on a parent.
 """
 
 from __future__ import annotations
@@ -17,7 +20,8 @@ import pytest
 
 from skillmem import hooks as H
 from skillmem import storage as S
-from tests.test_recall_budget import _in_order_reference
+from tests import owner_trusts
+from tests.test_recall_budget import _in_order_reference, _trusted
 
 # The two shipped parameter sets (hooks.auto_recall / hooks.tool_recall).
 PARAMS = {
@@ -97,18 +101,21 @@ def test_composer_properties_with_unapproved_rows(hook: str, memhome: Path) -> N
                 slug = f"{kind}-{case}-{i}"
                 S.upsert(conn, S.MemoryItem(
                     slug=slug, kind=kind, title="деплой " * rnd.randint(1, 8),
-                    body="деплой " * rnd.randint(20, 90)), owner_call=True)
+                    body="деплой " * rnd.randint(20, 90)))
                 if rnd.random() < 0.7:
-                    S.set_trust(conn, slug, trusted=True)
+                    owner_trusts(conn, slug, trusted=True)
                     approved.append(slug)
+        emitted = []
         out = H._recall_sections(
             conn, "деплой", seen=set(), skills_limit=p["skills_limit"],
             fb_limit=p["fb_limit"], body_chars=p["body_chars"],
-            fb_header=FB_HEADER, skills_header=SK_HEADER, budget=p["budget"])
+            fb_header=FB_HEADER, skills_header=SK_HEADER, budget=p["budget"],
+            emitted_slugs=emitted)
         conn.close()
 
         assert len(out) <= p["budget"], (hook, case, len(out))
         slugs = slug_re.findall(out)
+        assert emitted == slugs, "INV-03: ledger contains exactly the budgeted rows"
         assert len(slugs) == len(set(slugs)), (hook, case, slugs)
         assert out.count(H.UNTRUSTED_OPEN) == out.count(H.UNTRUSTED_CLOSE) <= 1
         framed = ""
@@ -127,11 +134,9 @@ def test_composer_properties_with_unapproved_rows(hook: str, memhome: Path) -> N
         # of v0.11.1 is the least it may deliver.
         conn = S.connect(memhome / f"{hook}-{case}.db")
         ok = lambda m: m.get("trusted_at") is not None  # noqa: E731
-        cand_fb = S.search(conn, "деплой", kind="feedback", limit=p["fb_limit"])
+        cand_fb = S.search(conn, "деплой", kind="feedback", limit=p["fb_limit"], visible=ok)
         cand_sk = S.recall_skills(conn, "деплой", limit=p["skills_limit"],
-                                  auto_reinforce=False)
-        cand_fb = [r for r in cand_fb if ok(r)]
-        cand_sk = [r for r in cand_sk if ok(r) and r.get("strength", 0.0) >= 0.0]
+                                  auto_reinforce=False, visible=ok)
         conn.close()
 
         def lines(rows):
@@ -142,3 +147,18 @@ def test_composer_properties_with_unapproved_rows(hook: str, memhome: Path) -> N
                                     p["budget"], lines)
         assert len(trusted_fb) + len(trusted_sk) >= len(floor), (
             hook, case, "delivered", trusted_fb + trusted_sk, "in-order floor", floor)
+
+
+def test_budget_edges_do_not_explode(memhome: Path) -> None:
+    conn = S.connect(memhome / "f.db")
+    S.init_schema(conn)
+    _trusted(conn, "feedback-x", "feedback", "Правило", "деплой " * 60)
+    _trusted(conn, "skill-y", "skill", "Скилл", "деплой " * 60)
+    for budget in (0, 1, 10, 40, 120):
+        emitted = []
+        out = H._recall_sections(
+            conn, "деплой", seen=set(), skills_limit=2, fb_limit=2,
+            body_chars=400, fb_header="### FB:", skills_header="### SK:",
+            budget=budget, emitted_slugs=emitted)
+        assert len(out) <= budget or out == "", (budget, len(out))
+        assert emitted == re.findall(r"^- \[([^\]\s]+)\]", out, re.M)

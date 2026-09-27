@@ -1,6 +1,6 @@
 [project]
 name = "skillmem"
-version = "0.11.3"
+version = "0.12.0"
 description = "Self-improving skills for Claude Code — your agent learns, recalls, reinforces, and forgets. SQLite + FTS5 + local embeddings + MCP."
 authors = [{ name = "Liza Studio" }]
 license = "Apache-2.0"
@@ -51,7 +51,7 @@ skillmem-mcp = "skillmem.mcp_server:run"
 skillmem-server = "skillmem.server:run"
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["pytest>=8.0", "hypothesis>=6.0"]
 # Semantic recall (local ONNX embeddings, no external API). Optional so the
 # base install stays light; recall degrades to BM25 when absent.
 semantic = ["fastembed>=0.8", "numpy>=1.26"]

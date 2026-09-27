@@ -50,7 +50,7 @@ def pack_dir(tmp_path: Path) -> Path:
 
 
 def test_reads_only_skill_files_outside_build_dirs(pack_dir: Path):
-    found = {p.parent.name for p in P.iter_skill_files(pack_dir)}
+    found = {p.parent.name for p, _ in P.iter_skill_files(pack_dir)}
     assert found == {"lazy", "deep"}          # the evals fixture is skipped
 
 

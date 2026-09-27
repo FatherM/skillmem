@@ -40,7 +40,7 @@ def _fake_release(tag: str, assets: dict[str, bytes]) -> tuple[dict, dict[str, b
 
 def test_upgrade_check_reports_available(no_legacy, monkeypatch: pytest.MonkeyPatch):
     meta, _ = _fake_release("v9.9.9", {})
-    monkeypatch.setattr(C, "_github_token", lambda: ("tok", "test"))
+    monkeypatch.setattr(C, "_github_token", lambda repo: ("tok", "test"))
     monkeypatch.setattr(C, "_gh_get",
                         lambda url, token, **kw: json.dumps(meta).encode())
     res = _run(["upgrade", "--check"])
@@ -49,10 +49,20 @@ def test_upgrade_check_reports_available(no_legacy, monkeypatch: pytest.MonkeyPa
     assert "9.9.9" in res.output
 
 
-def test_upgrade_requires_token(no_legacy, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(C, "_github_token", lambda: (None, "not found"))
+def test_upgrade_without_a_token_asks_anonymously_and_hints_on_failure(
+        no_legacy, monkeypatch: pytest.MonkeyPatch):
+    """The repo is public: a token used to be demanded before even asking."""
+    monkeypatch.setattr(C, "_github_token", lambda repo: (None, "not found"))
+    seen = []
+
+    def refuse(url, token, **kw):
+        seen.append(token)
+        raise OSError("HTTP Error 404")
+
+    monkeypatch.setattr(C, "_gh_get", refuse)
     res = _run(["upgrade", "--check"])
-    assert res.exit_code == 2
+    assert seen == [None]
+    assert res.exit_code == 1
     assert "token" in res.output.lower()
 
 
@@ -72,7 +82,7 @@ def test_upgrade_verifies_sha_and_execs_installer(
             return json.dumps(meta).encode()
         return blobs[url]
 
-    monkeypatch.setattr(C, "_github_token", lambda: ("tok", "test"))
+    monkeypatch.setattr(C, "_github_token", lambda repo: ("tok", "test"))
     monkeypatch.setattr(C, "_gh_get", fake_get)
     calls: list[list[str]] = []
     monkeypatch.setattr(os, "execvp", lambda prog, argv: calls.append(argv))
@@ -108,7 +118,7 @@ def test_upgrade_aborts_on_sha_mismatch(no_legacy, monkeypatch: pytest.MonkeyPat
             return json.dumps(meta).encode()
         return blobs[url]
 
-    monkeypatch.setattr(C, "_github_token", lambda: ("tok", "test"))
+    monkeypatch.setattr(C, "_github_token", lambda repo: ("tok", "test"))
     monkeypatch.setattr(C, "_gh_get", fake_get)
     execs: list = []
     monkeypatch.setattr(os, "execvp", lambda *a: execs.append(a))
@@ -124,7 +134,7 @@ def test_token_set_status_clear(memhome: Path, monkeypatch: pytest.MonkeyPatch):
     res = _run(["token", "set", "github_pat_TEST123"])
     assert res.exit_code == 0
     tf = memhome / "github_token"
-    assert tf.read_text().strip() == "github_pat_TEST123"
+    assert tf.read_text().split() == [C.DEFAULT_GITHUB_REPO, "github_pat_TEST123"]
 
     res = _run(["token", "status"])
     assert "present" in res.output
@@ -137,5 +147,5 @@ def test_token_set_status_clear(memhome: Path, monkeypatch: pytest.MonkeyPatch):
 
 def test_env_token_wins(memhome: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SKILLMEM_GITHUB_TOKEN", "env-tok")
-    tok, source = C._github_token()
+    tok, source = C._github_token("o/r")
     assert tok == "env-tok" and "env" in source

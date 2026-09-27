@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import os
-import struct
 from functools import lru_cache
 
 log = logging.getLogger("skillmem.embed")
@@ -65,6 +64,20 @@ def model_cache_dir() -> str:
     return os.path.join(user_cache_dir("skillmem"), "models")
 
 
+# Hooks and the MCP server load the model from the cache only. A cold cache
+# used to download ~220 MB inside a 10 s hook: every prompt hung for the full
+# timeout and recalled nothing, and each kill left a partial blob behind.
+# `skillmem doctor`, `reindex-embeddings` and the installer fetch it.
+_DOWNLOAD = False
+
+
+def allow_download() -> None:
+    """Let this process fetch the model if the cache lacks it."""
+    global _DOWNLOAD
+    _DOWNLOAD = True
+    _model.cache_clear()
+
+
 @lru_cache(maxsize=1)
 def _model():
     """Lazily construct the embedder once per process. Returns None on failure."""
@@ -82,9 +95,11 @@ def _model():
         # pooling) — silence it so it doesn't spam the MCP/CLI on every load.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return TextEmbedding(MODEL_NAME, cache_dir=model_cache_dir())
+            return TextEmbedding(MODEL_NAME, cache_dir=model_cache_dir(),
+                                 local_files_only=not _DOWNLOAD)
     except Exception as exc:  # model download/load failure
-        log.warning("could not load embedding model %s: %s", MODEL_NAME, exc)
+        log.warning("could not load embedding model %s: %s%s", MODEL_NAME, exc,
+                    "" if _DOWNLOAD else " — `skillmem doctor` downloads it")
         return None
 
 
@@ -113,15 +128,6 @@ def embed_text(text: str) -> bytes | None:
     except Exception as exc:  # never let embedding break a write/read
         log.warning("embed_text failed: %s", exc)
         return None
-
-
-def unpack(blob: bytes | None):
-    """bytes -> numpy float32 array (already normalized). None passes through."""
-    if not blob:
-        return None
-    import numpy as np
-
-    return np.frombuffer(blob, dtype="float32")
 
 
 def pack_query(text: str) -> bytes | None:

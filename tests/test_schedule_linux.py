@@ -23,8 +23,11 @@ def _proc(rc: int = 0, stdout: str = "", stderr: str = ""):
 def linux_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(SCHED.sys, "platform", "linux")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
     monkeypatch.setenv("SKILLMEM_HOME", str(tmp_path / "data"))
+    # the default database: its jobs keep the plain names
+    monkeypatch.setattr(SCHED.S, "user_data_dir", lambda *a, **kw: str(tmp_path / "data"))
     return tmp_path
 
 

@@ -1,0 +1,16 @@
+# Test functions committed apart from the fix they guard: after it, or before
+# a later fix of the defect their own commit made. Each is green on the parent
+# of the commit that added it, so release gate check 5 runs it on the parent of
+# the fix named here instead, where it must fail (scripts/gate_new_tests.py).
+#
+# <test id>  <fix commit>...   (fails on the parent of at least one)
+# <test id>  guard            (checks a fix kept something working; green on its parent by design)
+tests/test_recall_budget.py::test_a_row_flipping_sides_mid_flight_does_not_evict_a_ranked_unapproved_row 693165b
+tests/test_recall_budget.py::test_an_edit_during_the_second_pass_is_still_framed 693165b
+tests/test_release_0_11_3_audit.py::test_a_second_export_keeps_every_case_variant 6b3e83f 88cfa21   # APFS fixed at 6b3e83f, ext4 at 88cfa21
+tests/test_hooks_fuzz.py::test_full_init_wires_the_tested_commands b755e66
+tests/test_hooks_fuzz.py::test_locked_database_does_not_outlive_hook_timeout 5f1800b
+tests/test_release_0_11_3_audit.py::test_another_writer_finishes_while_an_http_write_embeds f22e6f5
+tests/test_release_0_11_3_audit.py::test_a_dump_from_before_the_seal_is_sealed_by_its_origin guard   # 90b87a1 kept pre-seal dumps sealed by origin
+tests/test_release_gate.py::test_a_test_naming_several_fixes_passes_when_one_parent_fails edcd186   # written one commit after the gate change
+tests/test_release_gate.py::test_a_test_marked_guard_is_skipped_and_counted edcd186

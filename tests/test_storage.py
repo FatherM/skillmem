@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from skillmem import storage as S
+from tests import as_owner, owner_trusts
 
 
 def _item(slug, body="hello world", **kw):
@@ -191,13 +192,14 @@ def test_metadata_only_write_is_applied_not_silently_dropped(conn):
     survive (the words did not change), but the write has to land."""
     S.upsert(conn, S.MemoryItem(slug="n-meta", kind="note", origin="owner",
                                 title="Заголовок", body="Тело"))
-    S.set_trust(conn, "n-meta", trusted=True)
+    owner_trusts(conn, "n-meta", trusted=True)
     conn.commit()
 
-    S.upsert(conn, S.MemoryItem(slug="n-meta", kind="note", origin="owner",
-                                title="Заголовок", body="Тело",
-                                project="liza", tags=["deploy"]),
-             reason="сменить проект")
+    with as_owner():     # approval sealed it: only the owner changes it
+        S.upsert(conn, S.MemoryItem(slug="n-meta", kind="note", origin="owner",
+                                    title="Заголовок", body="Тело",
+                                    project="liza", tags=["deploy"]),
+                 explicit={"project", "tags"}, reason="сменить проект")
     conn.commit()
 
     item = S.get(conn, "n-meta")

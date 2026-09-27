@@ -19,14 +19,14 @@ skillmem gives Claude Code and the Codex CLI a local, persistent skill & memory 
 - **$0 per write and per read** — no LLM calls, no cloud, no API keys. Plain SQLite on your disk.
 - **Bilingual hybrid search, fully local** — FTS5 BM25 + Snowball stemming (EN/RU) matches inflected forms within a language; the multilingual ONNX embedder is what lets a Russian query find an English skill, so install the `semantic` extra if you work across both. All on CPU, offline.
 - **Ebbinghaus strength model, earned not claimed** — strength rises only on evidence from outside the agent's own judgement, falls after a failure, and fades on a schedule when unused; dead skills are swept to a backed-up archive (never deleted). Rules that are rare by nature can be pinned out of decay.
-- **Provenance, and trust the owner grants** — every memory records where it came from (`owner` / `agent` / `imported` / `derived`), and only the owner approves one as a rule (`skillmem trust <slug>`). Anything unapproved — an imported pack, a summary of a transcript that quoted a web page, a rule an agent was talked into saving — is injected inside a marked block that says it is data, not instructions. Editing an approved memory drops the approval with it.
+- **Provenance, and trust the owner grants** — every memory records where it came from (`owner` / `agent` / `imported` / `derived`), and only the owner approves one as a rule (`skillmem trust <slug>`). Anything unapproved — an imported pack, a summary of a transcript that quoted a web page, a rule an agent was talked into saving — is injected inside a marked block that says it is data, not instructions. An agent cannot change a memory the owner wrote or approved: it writes a proposal under a new slug.
 - **Tamper-evident history** — every edit is appended to a SHA256 hash-chain; `skillmem verify` detects any after-the-fact tampering.
-- **Deep Claude Code integration** — hooks on five events + 10 MCP tools installed with one command.
+- **Deep Claude Code integration** — hooks on five events + 9 MCP tools installed with one command.
 - **One memory, several agents** — Claude Code and Codex share a single database, and every
   record carries the agent that wrote it, taken from the MCP handshake, so authorship stays
   readable when they learn side by side.
 - **Cross-platform** — macOS (launchd), Windows (schtasks), Linux (systemd user timers, cron fallback).
-- **No vendor lock** — `export-all` dumps everything to plain markdown with YAML frontmatter; re-importing the dump yields the same records. One destination per database: the exporter prunes its own stale files via a manifest and will not judge another database's.
+- **No vendor lock** — `export-all` dumps everything to plain markdown with YAML frontmatter; re-importing the dump yields the same records. One destination per database: the exporter prunes its own stale files via a manifest, and refuses a directory another database exports to rather than overwrite its backup.
 
 ## Why
 
@@ -67,7 +67,7 @@ a hosted tier. skillmem is narrower on purpose and different on four axes:
 | **Where strength comes from** | outside evidence only — a passing test, an accepted diff, your confirmation. An agent saying "that helped" moves recency, never strength, so it cannot promote its own mistake. `reinforce` is not idempotent: a retried confirmation counts again (evidence ids are a later release) |
 | **Who is trusted** | you. Provenance is recorded, approval is yours to give, and unapproved memory arrives framed as data |
 | **Where it runs** | your disk. SQLite + FTS5 + a local ONNX embedding model. No API key, no cloud, no Docker, no graph database |
-| **How it reaches the agent** | hooks on five events (SessionStart, UserPromptSubmit, PreToolUse, Stop, SessionEnd) — recall happens whether or not the agent thinks to ask, plus 10 MCP tools when it does |
+| **How it reaches the agent** | hooks on five events (SessionStart, UserPromptSubmit, PreToolUse, Stop, SessionEnd) — recall happens whether or not the agent thinks to ask, plus 9 MCP tools when it does |
 
 Retrieval quality is measured, not asserted: **hit@5 0.871 / MRR 0.622** on the full LongMemEval
 oracle set, hybrid retrieval, k=5, CPU only, reproducible from this repo — see
@@ -78,7 +78,8 @@ oracle set, hybrid retrieval, k=5, CPU only, reproducible from this repo — see
 macOS / Linux:
 
 ```bash
-bash install.sh                 # installs python + uv if needed, venv, symlinks
+pip install 'skillmem[semantic]'   # or: uv tool install 'skillmem[semantic]'
+skillmem doctor                     # downloads the embedding model once (~220 MB)
 ```
 
 Windows (PowerShell):
@@ -117,7 +118,7 @@ with `SKILLMEM_AGENT`, so in a shared database "who learned this" stays
 answerable. `skillmem uninstall` removes all of them (`--no-editors` to keep
 the editor entries).
 
-`init --claude-code` registers the MCP server in `~/.claude.json` and the hooks in `~/.claude/settings.json` (idempotent, with backups). Use `--hooks minimal` for no hooks at all (only the `skillmem trust` deny rule below), or `--hooks none` for MCP only. Hand-written memory files are imported with `skillmem migrate --source <dir>`; there is no per-turn import hook.
+`init --claude-code` registers the MCP server in `~/.claude.json` and the hooks in `~/.claude/settings.json` (idempotent, with backups). Use `--hooks minimal` for no hooks at all (only the deny rules for the owner-only commands, below), or `--hooks none` for MCP only. Hand-written memory files are imported with `skillmem migrate --source <dir>`; there is no per-turn import hook.
 
 ### Codex CLI
 
@@ -145,7 +146,7 @@ The repo is also a plugin, in two flavours, both pointing at the same `skillmem-
   marketplace. `mcp.json` needs both its `$schema` and `"type": "stdio"`, and the command must be a bare
   executable name rather than an absolute path — Codex's parser ignores the file otherwise, with no error.
   `codex mcp list` listing the server is the check that it parsed.
-- **Claude Code** (`.claude-plugin/` + `hooks/hooks.json`) — MCP server *and* all six hooks in one install.
+- **Claude Code** (`.claude-plugin/` + `hooks/hooks.json`) — MCP server *and* every hook in one install.
 
 Either way the package itself must be on PATH (`pip install skillmem`); the plugin wires the server, not the runtime. An MCP Registry manifest (`server.json`) is in the repo as well:
 
@@ -155,6 +156,8 @@ Either way the package itself must be on PATH (`pip install skillmem`); the plug
 ```
 
 The plugin requires the skillmem Python package on PATH and replaces `skillmem init --claude-code`'s wiring — use one or the other, not both (see [docs/PUBLISHING.md](docs/PUBLISHING.md)).
+
+A plugin cannot add permission rules, so the plugin path has no deny rules for the owner-only commands (`trust`, `rm`, `skills-archive`, `skills-restore`, `skills rm`, `import-vault`, `uninstall --purge-db`) — only their TTY check, which a pseudo-terminal gets past. `skillmem init --claude-code` installs both. Neither is a wall against an agent that has a shell: the rules match the command as written, and a quote inside the verb (`skillmem tr''ust x` under `script`) matches none of them. If agents run unattended with Bash on this machine, do not rely on them. The rules are a substring match: on a machine where you develop in a directory named `skillmem`, they also refuse your own commands there that mention one of those commands, `--db`, `$`, a backtick or `eval`.
 
 ### Claude Desktop (chat app)
 
@@ -169,7 +172,7 @@ The MCP server also works in the Claude Desktop chat app — add to
 }
 ```
 
-You get all 10 `mem_*` tools on demand (search, learn, recall, reinforce…).
+You get all 9 `mem_*` tools on demand (search, learn, recall, reinforce…).
 The automatic hooks (auto-recall on every prompt, session recap) are a
 Claude Code mechanism and do not run in the chat app.
 
@@ -198,11 +201,11 @@ Claude Code mechanism and do not run in the chat app.
 | `mem_get` | Fetch one memory by slug, with history and wikilinks |
 | `mem_list` | List memories by kind/project, most recent first |
 | `mem_write` | Insert a new memory; refuses silent overwrites and near-duplicates |
-| `mem_update` | Update an existing memory; old version is kept in the hash-chained history |
+| `mem_update` | Update an existing memory; old version is kept in the hash-chained history. Refused for an archived record and for one the owner wrote or approved |
 | `mem_learn` | Record an after-action skill (trigger / steps / outcome / lessons) |
 | `mem_recall` | Find relevant skills for a task, strength-weighted; refreshes recency |
 | `mem_reinforce` | Record how a skill turned out; only outside evidence moves strength |
-| `mem_pin` | Exempt a skill from decay and archiving (and undo it) |
+| `mem_pin` | Exempt a skill from decay and archiving (and undo it); only the owner changes the pin of their own record |
 
 ## Skill packs
 
@@ -259,11 +262,15 @@ sitting inside data. That guarantee comes from the reader having no tools — wh
 summariser has none.
 
 **Who can approve.** `skillmem trust <slug>` (and `--untrust`) refuses to run without a terminal,
-so an agent calling it from Bash gets an error, not an approval. A TTY check is accident
-protection, not a wall — `script -q /dev/null skillmem trust x` forges one — so
-`init --claude-code` also adds `"Bash(skillmem trust*)"` to `permissions.deny` in
-`~/.claude/settings.json`; that rule is what stops Claude Code from running the command at a
-document's request. Other agents need the equivalent rule in their own permission config.
+so an agent calling it from Bash gets an error, not an approval. So do the other owner-only
+commands: `rm`, `skills-archive` (and `--restore`), `skills-restore`, `skills rm`, `import-vault`
+and `uninstall --purge-db`. The MCP and HTTP servers never count as you, even when they run in
+your terminal. A TTY check is accident protection, not a wall — `script -q /dev/null skillmem trust x` forges one — so
+`init --claude-code` also adds deny rules for those commands to `permissions.deny` in
+`~/.claude/settings.json`; they stop Claude Code from running the command as a document spells
+it. They are glob matches on the command line before the shell rewrites it, so they are not a
+wall either: `script -qec "skillmem tr''ust x" /dev/null` matches none of them. Other agents
+need the equivalent rules in their own permission config.
 
 ## CLI highlights
 
@@ -272,24 +279,33 @@ skillmem learn skill-x -t "..." --trigger "..." --steps "..." --outcome success
 skillmem recall "deploy the bot to prod"
 skillmem skills-top              # list skills with strength bars
 skillmem decay --days 14         # manual decay + lifecycle sweep
-skillmem search "hash chain"     # session recaps hidden by default; --notes to include
+skillmem search "hash chain"     # kind `note` (recaps, `write`'s default) hidden; --notes to include
 skillmem trust skill-x           # approve a memory as a rule (--untrust to withdraw)
 skillmem recap                   # write a recap now, without waiting for the rate limit
 skillmem hooks-status            # what the hooks actually did: runs, skips, failures
 skillmem verify --strict         # check the tamper-evidence chain
 skillmem export-all ./vault      # markdown round-trip, no lock-in
-skillmem import-vault ~/Obsidian/Notes
+skillmem import-vault ~/Obsidian/Notes   # owner-only: run it at a terminal
 skillmem schedule install        # decay daily 04:15, export weekly Sun 04:30
 ```
 
 ## Uninstall
 
 ```bash
-skillmem uninstall               # removes MCP entries (both agents), hooks, the trust deny rule, scheduled jobs; keeps the DB
-skillmem uninstall --purge-db    # ...and deletes the database
+skillmem uninstall               # removes every agent's MCP entry, hooks, deny rules, scheduled jobs; keeps the DB
+skillmem uninstall --purge-db    # ...and deletes the database (at a terminal only)
 ```
 
 Config edits are made atomically with timestamped backups; corrupt JSON or TOML is never overwritten.
+
+## Guarantees
+
+[docs/INVARIANTS.md](docs/INVARIANTS.md) is the specification skillmem is tested against: sixteen
+invariants (approval is bound to the text, only the owner at a terminal grants trust, a sealed
+record changes only by the owner, backups round-trip, every read-then-write decision is made
+under the write lock, …), the function that enforces each, and their status at the current
+release. `tests/properties/` checks them. What is still open is listed under "Known issues" in
+the [CHANGELOG](CHANGELOG.md).
 
 ## Docker
 

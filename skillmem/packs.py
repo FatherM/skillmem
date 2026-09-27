@@ -23,7 +23,7 @@ Three rules this module holds to:
 
 from __future__ import annotations
 
-import json
+import os
 import re
 import shutil
 import subprocess
@@ -33,7 +33,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from . import storage as S
+from . import hooks as H, storage as S
+from .export import _filename_key
+from .migrate import _scalar, split_frontmatter, tree
 
 #: Skill files larger than this are skipped: a SKILL.md is a page of rules,
 #: and anything this size is a document that would swamp recall.
@@ -41,13 +43,12 @@ MAX_SKILL_BYTES = 64_000
 MAX_PACK_SKILLS = 500          # aggregate caps: a pack is a folder, not a firehose
 MAX_PACK_BYTES = 4_000_000
 
-#: Directories that never hold skills worth importing.
+#: Directories whose skills are not the pack's own (vendored, built, test data).
 SKIP_DIRS = {".git", "node_modules", "__pycache__", "benchmarks", "evals",
              "tests", "test", "fixtures", ".venv", "dist", "build"}
 
 LICENSE_FILES = ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING")
 
-_FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _SLUG_SAFE = re.compile(r"[^a-z0-9]+")
 
 
@@ -74,8 +75,10 @@ class PackReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
+        # the licence line is the pack's text, and the imported rows' (INV-07)
+        license = H.render_untrusted(self.license) if self.license else None
         return {"pack": self.pack, "source": self.source, "commit": self.commit,
-                "license": self.license, "imported": self.imported,
+                "license": license, "imported": self.imported,
                 "skipped": [{"path": p, "reason": r} for p, r in self.skipped]}
 
 
@@ -89,7 +92,7 @@ def resolve_source(source: str) -> tuple[str, str]:
     ``owner/repo`` is GitHub shorthand — the same spelling a marketplace uses.
     """
     local = Path(source).expanduser()
-    if local.exists():
+    if os.path.exists(local):
         return str(local.resolve()), _slugify(local.resolve().name)
     if re.fullmatch(r"[\w.-]+/[\w.-]+", source):
         return f"https://github.com/{source}.git", _slugify(source.split("/")[1])
@@ -97,31 +100,9 @@ def resolve_source(source: str) -> tuple[str, str]:
     return source, name
 
 
-def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
-    """Pull `name:` and `description:` out of YAML frontmatter, if present.
-
-    Deliberately not a YAML parser: skill frontmatter is a handful of scalar
-    keys, and a folded multi-line description is the only shape that needs
-    care. Anything unparsed simply falls back to the file path.
-    """
-    m = _FRONTMATTER.match(text)
-    if not m:
-        return {}, text
-    meta: dict[str, str] = {}
-    key: str | None = None
-    for line in m.group(1).splitlines():
-        head = re.match(r"^([A-Za-z_-]+):\s*(.*)$", line)
-        if head:
-            key = head.group(1).strip().lower()
-            value = head.group(2).strip()
-            meta[key] = "" if value in {">", "|", ">-", "|-"} else value.strip('"\'')
-        elif key and line.strip():
-            meta[key] = (meta.get(key, "") + " " + line.strip()).strip()
-    return meta, text[m.end():]
-
-
-def iter_skill_files(root: Path) -> Iterator[Path]:
-    """Every SKILL.md under ``root``, skipping build and test directories.
+def iter_skill_files(root: Path) -> Iterator[tuple[Path, str | None]]:
+    """Every SKILL.md under ``root``, skipping build and test directories,
+    with the reason it is not imported, if any.
 
     Packs ship the same skill several times over, once per agent format
     (``skills/x/SKILL.md``, ``.openclaw/skills/x/SKILL.md``, ...). Visible
@@ -133,42 +114,85 @@ def iter_skill_files(root: Path) -> Iterator[Path]:
         hidden = any(part.startswith(".") for part in rel.parts)
         return (1 if hidden else 0, rel.as_posix())
 
-    for path in sorted(root.rglob("SKILL.md"), key=rank):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+    # by name, not glob: rglob matched `skill.md` on Windows only (INV-11)
+    paths, unreadable = tree(root)
+    for folder in sorted(unreadable, key=rank):
+        if not any(part in SKIP_DIRS for part in folder.relative_to(root).parts[:-1]):
+            yield folder, "cannot be read; not imported"
+    for path in sorted((p for p in paths
+                        if _filename_key(p.name) == "skill.md"
+                        or os.path.islink(p) and not os.path.isfile(p)), key=rank):
+        # the folders it sits under, not its own: a skill named `build` or
+        # `test` was left out, unreported, with exit 0 (INV-08)
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts[:-2]):
             continue
-        # a symlink named SKILL.md would import whatever it points at
-        # (~/.ssh/id_rsa fits under the size cap); only real files in-tree
-        if path.is_symlink() or not path.is_file():
+        if os.path.islink(path) and os.path.isdir(path):
+            yield path, "directory symlink is not traversed; not imported"
+            continue
+        # Only files in-tree; read_pack deduplicates copies by their text.
+        # A link's target need not itself be named SKILL.md (INV-08).
+        if not os.path.isfile(path):
+            if os.path.islink(path):
+                yield path, "does not lead to a readable file; not imported"
+            elif not os.path.isdir(path):    # in a folder it may list, not search
+                yield path, "cannot be read; not imported"
             continue
         try:
-            path.resolve().relative_to(root.resolve())
-        except ValueError:
-            continue
-        yield path
+            inside = path.resolve().is_relative_to(root.resolve())
+        except (OSError, RuntimeError):
+            inside = False
+        if not inside:
+            yield path, "leads outside the pack; not imported"
+        else:
+            yield path, None
 
 
-def read_pack(root: Path) -> list[PackSkill]:
-    """Parse a pack's skills, one per name — per-agent copies are dropped."""
+def read_pack(root: Path, skipped: list[tuple[str, str]] | None = None) -> list[PackSkill]:
+    """Parse a pack's skills, one per name — per-agent copies are dropped.
+
+    A copy carries the same name, title and procedure. Anything else that
+    would take the slug — a different name that slugifies alike, or the same
+    name over other text — is another skill, and it goes to ``skipped`` with
+    the reason: dropping it silently reported the pack imported whole (INV-08).
+    """
     skills: list[PackSkill] = []
-    seen: set[str] = set()
+    seen: dict[str, tuple[str, str, str, str]] = {}      # slug -> (name, title, body, path)
+    skipped = [] if skipped is None else skipped
     total = 0
-    for path in iter_skill_files(root):
+    for path, refused in iter_skill_files(root):
         rel = path.relative_to(root).as_posix()
-        size = path.stat().st_size
-        if size > MAX_SKILL_BYTES:
+        if refused:
+            skipped.append((rel, refused))
             continue
-        # per-file cap alone let a pack of ten thousand small files eat memory
+        size = path.stat().st_size
+        # per file and per pack, and a file left out is reported (INV-08)
+        if size > MAX_SKILL_BYTES:
+            skipped.append((rel, f"{size} bytes, over the {MAX_SKILL_BYTES}-byte skill limit"))
+            continue
+        if len(skills) >= MAX_PACK_SKILLS or total + size > MAX_PACK_BYTES:
+            skipped.append((rel, f"over the pack limit of {MAX_PACK_SKILLS} skills "
+                                 f"or {MAX_PACK_BYTES} bytes"))
+            continue
         total += size
-        if len(skills) >= MAX_PACK_SKILLS or total > MAX_PACK_BYTES:
-            break
-        text = path.read_text(encoding="utf-8", errors="replace")
-        meta, body = _parse_frontmatter(text)
-        name = meta.get("name") or path.parent.name
-        description = meta.get("description", "")
+        try:
+            # utf-8-sig: a BOM hid the frontmatter; a byte that is not UTF-8 fails the file
+            text = path.read_text(encoding="utf-8-sig")
+            meta, body = split_frontmatter(text)
+            name = _scalar(meta.get("name"), "name") or path.parent.name
+            description = (_scalar(meta.get("description"), "description") or "").strip()
+        except (ValueError, OSError) as exc:
+            skipped.append((rel, str(exc)))
+            continue
         title = description.split(".")[0][:120].strip() or name
         if _slugify(name) in seen:
+            first_name, first_title, first_body, first_rel = seen[_slugify(name)]
+            # a copy has the same name, title and procedure
+            if (name, title, body.strip()) != (first_name, first_title, first_body):
+                what = (f"name {name!r} makes the same slug as {first_name!r}"
+                        if name != first_name else f"another procedure is named {name!r}")
+                skipped.append((rel, f"{what} ({first_rel}); rename one of them"))
             continue
-        seen.add(_slugify(name))
+        seen[_slugify(name)] = (name, title, body.strip(), rel)
         skills.append(PackSkill(name=_slugify(name), title=title,
                                 description=description, body=body.strip(),
                                 rel_path=rel))
@@ -183,10 +207,14 @@ def _git(args: list[str], cwd: Path | None = None) -> str:
 
 
 def _detect_license(root: Path) -> str | None:
-    """First line of the licence file that names the licence, if any."""
+    """First line of the licence file that names the licence, if any. Found
+    by name in any case, the exact name first, on every filesystem (INV-11)."""
+    by_name: dict[str, Path] = {}
+    for entry in sorted(root.iterdir(), key=lambda e: (e.name not in LICENSE_FILES, e.name)):
+        by_name.setdefault(_filename_key(entry.name), entry)
     for name in LICENSE_FILES:
-        path = root / name
-        if not path.is_file() or path.is_symlink():
+        path = by_name.get(_filename_key(name))
+        if path is None or not os.path.isfile(path) or os.path.islink(path):
             continue
         with path.open("rb") as fh:  # bounded read: a 2 GB LICENSE is not our problem
             head = fh.read(400).decode("utf-8", errors="replace")
@@ -232,7 +260,7 @@ def import_pack(
     pack = pack_name or derived
     tmp: Path | None = None
     try:
-        if Path(url).exists():
+        if os.path.exists(url):
             root = Path(url)
             commit = None
         else:
@@ -243,8 +271,8 @@ def import_pack(
 
         report = PackReport(pack=pack, source=source, commit=commit,
                             license=_detect_license(root))
-        skills = read_pack(root)
-        if not skills:
+        skills = read_pack(root, report.skipped)
+        if not skills and not report.skipped:
             raise PackError(f"no SKILL.md files found in {source}")
 
         for skill in skills:
@@ -266,22 +294,23 @@ def import_pack(
                 topics=[pack],
             )
             try:
-                # force=True must only ever replace THIS pack's own rows. A
-                # slug that belongs to the owner (or another pack) is not ours
-                # to overwrite — an approved rule used to be silently replaced
-                # by whatever a repo shipped under a colliding name.
-                prior = conn.execute(
-                    "SELECT origin, project, deleted_at FROM memory_items WHERE slug = ?",
-                    (slug,),
-                ).fetchone()
-                if prior is not None and (prior["origin"] != "imported"
-                                          or prior["project"] != f"pack:{pack}"):
-                    raise PackError(
-                        f"slug '{slug}' exists and is not from pack '{pack}' — not overwritten"
-                    )
-                # revive: a removed pack being reinstalled comes back visible
-                S.upsert(conn, item, reason=f"import from {source}",
-                         force=True, check_conflicts=False, revive=True)
+                # force=True replaces this pack's own rows only; the ownership
+                # check and the write are one transaction (INV-05)
+                with S.tx(conn):
+                    prior = conn.execute(
+                        "SELECT origin, project, deleted_at FROM memory_items WHERE slug = ?",
+                        (slug,),
+                    ).fetchone()
+                    if prior is not None and (prior["origin"] != "imported"
+                                              or prior["project"] != f"pack:{pack}"):
+                        raise PackError(
+                            f"slug '{slug}' exists and is not from pack '{pack}' — not overwritten"
+                        )
+                    # revive: a removed pack reinstalled comes back; a sealed row is refused
+                    S.upsert(conn, item, surface="pack", reason=f"import from {source}",
+                             explicit={"kind", "project", "agent", "visibility",
+                                       "tags", "topics"},
+                             force=True, check_conflicts=False, revive=True)
                 report.imported.append(slug)
             except Exception as exc:                      # noqa: BLE001
                 report.skipped.append((skill.rel_path, str(exc)))
@@ -325,34 +354,13 @@ def remove_pack(conn: sqlite3.Connection, pack: str, *, reason: str) -> list[str
     rewrites it), so it is not the key.
     """
     prefix = f"pack-{pack}-"
-    # One transaction over the selection and the deletes: the seal filter picks
-    # candidates, and the owner can approve one of them in another process
-    # between the SELECT and the soft_delete — the record was then tombstoned
-    # with owner_seal = 1 on it.
+    # the selection and the deletes in one transaction: an approval landing
+    # between them is honoured
     with S.tx(conn):
-        return _remove_pack_rows(conn, pack, prefix, reason)
-
-
-def _remove_pack_rows(
-    conn: sqlite3.Connection, pack: str, prefix: str, reason: str
-) -> list[str]:
-    rows = conn.execute(
-        "SELECT slug FROM memory_items WHERE project = ? AND slug LIKE ? ESCAPE '\\' "
-        # origin <> 'owner' is not enough: an agent may relabel origin to
-        # 'agent' and set project='pack:<name>' on a record whose slug happens
-        # to match the prefix, and the owner's own pack removal would then
-        # delete it. owner_seal cannot be relabelled.
-        "AND origin <> 'owner' AND owner_seal = 0 AND deleted_at IS NULL",
-        (f"pack:{pack}", prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"),
-    ).fetchall()
-    removed = []
-    for r in rows:
-        # the SELECT above already excludes sealed rows; the default keeps it
-        # true if that filter is ever loosened
-        if S.soft_delete(conn, r["slug"], reason):
-            removed.append(r["slug"])
-    return removed
-
-
-__all__ = ["PackError", "PackReport", "PackSkill", "import_pack", "list_packs",
-           "read_pack", "remove_pack", "resolve_source", "iter_skill_files"]
+        rows = conn.execute(
+            "SELECT slug FROM memory_items WHERE project = ? AND slug LIKE ? ESCAPE '\\' "
+            # owner_seal, not origin alone: origin and project are an agent's to relabel
+            "AND origin <> 'owner' AND owner_seal = 0 AND deleted_at IS NULL",
+            (f"pack:{pack}", prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"),
+        ).fetchall()
+        return [r["slug"] for r in rows if S.soft_delete(conn, r["slug"], reason)]

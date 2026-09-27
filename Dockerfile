@@ -19,6 +19,12 @@ RUN pip install --no-cache-dir ".${EXTRAS}"
 ENV SKILLMEM_HOME=/data
 VOLUME ["/data"]
 
-# stdio transport: start immediately while the client keeps stdin open.
+# stdio transport: an MCP client talks to this process over stdin/stdout.
+#
+# Directly, not through a shim. A shim that drained stdin first shipped in
+# 0.11.2 and was wrong twice over: its very first statement read stdin to EOF,
+# which a normal client never sends, so the server was never started at all —
+# and the scan it was written for never used this image, because the catalogue
+# builds its own. Removed in 0.11.3.
 ENTRYPOINT ["skillmem", "mcp"]
 CMD []

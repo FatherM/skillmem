@@ -53,7 +53,7 @@ def test_failed_update_leaves_old_body_intact(conn, monkeypatch):
 
     restore = _fail_inside_tx(monkeypatch)
     with pytest.raises(RuntimeError):
-        S.upsert(conn, _item(BIG_B), reason="rewrite", links=["something"])
+        S.upsert(conn, _item(BIG_B), reason="rewrite")
     restore()
 
     row = S.get(conn, "big-doc")
@@ -64,7 +64,7 @@ def test_failed_update_leaves_old_body_intact(conn, monkeypatch):
 def test_failed_insert_leaves_no_stray_file(conn, monkeypatch):
     restore = _fail_inside_tx(monkeypatch)
     with pytest.raises(RuntimeError):
-        S.upsert(conn, _item(BIG_A), links=["x"])
+        S.upsert(conn, _item(BIG_A))
     restore()
 
     assert S.get(conn, "big-doc") is None

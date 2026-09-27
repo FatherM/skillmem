@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,7 @@ def test_skip_auto_memories_flag(conn, tmp_path: Path):
     assert S.get(conn, "auto-note").kind == "feedback"  # metadata.type wins over default
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require Windows developer mode or elevated privileges")
 def test_import_vault_ignores_a_symlinked_note_pointing_outside(tmp_path, monkeypatch):
     import os
     from skillmem import vault as V, storage as S

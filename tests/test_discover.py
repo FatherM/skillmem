@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ def test_discover_finds_multiple(tmp_path: Path):
     assert all(p.name == "memory" for p in found)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require Windows developer mode or elevated privileges")
 def test_discover_skips_dead_symlink(tmp_path: Path):
     projects = tmp_path / ".claude" / "projects"
     (projects / "good" / "memory").mkdir(parents=True)

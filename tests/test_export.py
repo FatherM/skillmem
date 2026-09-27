@@ -17,6 +17,7 @@ import yaml
 from skillmem import storage as S
 from skillmem.export import export_all
 from skillmem.vault import import_vault
+from tests import owner_trusts
 
 
 # Comfortably over the 8 KB externalization threshold, bilingual on purpose.
@@ -60,7 +61,7 @@ def _seed(conn) -> dict[str, S.MemoryItem]:
         ),
     }
     for item in items.values():
-        S.upsert(conn, item, links=S.extract_wikilinks(item.body))
+        S.upsert(conn, item)
     return items
 
 
@@ -359,8 +360,8 @@ def test_the_owners_dump_restores_a_sealed_archived_record(tmp_path, monkeypatch
     src = S.connect(tmp_path / "home" / "memory.db"); S.init_schema(src)
     S.upsert(src, S.MemoryItem(slug="sealed-arch", kind="feedback", title="rule",
                                body="a retired rule of the owner's own",
-                               origin="owner"), owner_call=True)
-    S.set_trust(src, "sealed-arch", trusted=True)
+                               origin="owner"))
+    owner_trusts(src, "sealed-arch", trusted=True)
     # set_archived asks owner_present() itself now, so this branch of the test
     # (the owner archiving their own record) has to raise the flag first.
     monkeypatch.setattr(S, "owner_present", lambda: True)
@@ -396,8 +397,8 @@ def test_a_swapped_body_file_is_not_served_as_approved_text(tmp_path, monkeypatc
     conn = S.connect(tmp_path / "home" / "memory.db"); S.init_schema(conn)
     big = "the owner's rule about the deploy gate. " * 400
     S.upsert(conn, S.MemoryItem(slug="big-rule", kind="feedback", title="rule",
-                                body=big, origin="owner"), owner_call=True)
-    S.set_trust(conn, "big-rule", trusted=True)
+                                body=big, origin="owner"))
+    owner_trusts(conn, "big-rule", trusted=True)
     item = S.get(conn, "big-rule")
     assert item.body_path, "body should be externalised at this size"
     (S.docs_dir() / item.body_path).write_text(

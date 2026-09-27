@@ -16,19 +16,18 @@ no frontmatter or with loose Obsidian frontmatter.
 from __future__ import annotations
 
 import hashlib
+import math
+import os
 import re
-import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .migrate import desurrogate
-
-import yaml
-
 from . import storage as S
+from .export import _filename_key, _publish, intact_asset
+from .migrate import (ImportReport, _file_kind, _first_line, _scalar, desurrogate,
+                      iter_notes, split_frontmatter)
 from .migrate import _origin_from as _migrate_origin
-from .migrate import FRONTMATTER_RE
 
 
 SUPPORTED_TEXT = {".md", ".markdown"}
@@ -39,11 +38,11 @@ _SLUG_TRIM = re.compile(r"[^a-z0-9а-яё\-]+", re.IGNORECASE)
 
 def _slug_from_meta_or_path(meta: dict, root: Path, path: Path) -> str:
     """Prefer frontmatter ``name:`` so an export/import round-trip is lossless."""
-    raw = meta.get("name")
-    if raw and _is_auto_memory(meta):
-        return str(raw)          # a skillmem dump: the slug is exact, or a_b and a-b merge
+    raw = _scalar(meta.get("name"), "name")
+    if raw and _is_dump(meta):
+        return raw               # a skillmem dump: the slug is exact, or a_b and a-b merge
     if raw:
-        slug = _SLUG_TRIM.sub("-", str(raw).lower())
+        slug = _SLUG_TRIM.sub("-", raw.lower())
     else:
         rel = path.relative_to(root).with_suffix("")
         joined = "-".join(p.lower() for p in rel.parts)
@@ -61,17 +60,8 @@ def _project_from_path(root: Path, path: Path) -> str | None:
 
 
 def _parse_md(text: str) -> tuple[dict, str]:
-    match = FRONTMATTER_RE.match(text)
-    if not match:
-        return {}, text.strip()
-    raw, body = match.group(1), match.group(2)
-    try:
-        meta = yaml.safe_load(raw) or {}
-    except yaml.YAMLError:
-        meta = {}
-    if not isinstance(meta, dict):
-        meta = {}
-    if _is_auto_memory(meta):
+    meta, body = split_frontmatter(text)
+    if _is_dump(meta):
         # a skillmem dump wrote "\n---\n\n<body>\n": undo exactly that, keep the
         # body's own whitespace so its content hash (and approval) survives
         if body.startswith("\n"):
@@ -80,17 +70,33 @@ def _parse_md(text: str) -> tuple[dict, str]:
             body = body[:-1]
     else:
         body = body.strip()
-    # Same surrogate hazard as migrate.parse_file — see migrate.desurrogate.
     return desurrogate(meta), desurrogate(body)
 
 
-def _str_list(value) -> list[str]:
-    """Frontmatter list coercion: Obsidian allows both ``tags: [a, b]`` and ``tags: a``."""
+def _str_list(value, key: str = "list") -> list[str]:
+    """Frontmatter list coercion: Obsidian allows both ``tags: [a, b]`` and ``tags: a``.
+    Null and "" are empty; anything else that is not one is refused (INV-14): a mapping
+    became [] and cleared the field, and a null item was dropped (*r09 opus review*)."""
+    if value is None:
+        return []
     if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(v) for v in value if v is not None]
-    return []
+        return [value] if value else []
+    if isinstance(value, list) and all(isinstance(v, (str, int, float)) and not isinstance(v, bool)
+                                       for v in value):   # `true` became the tag "True"
+        return [str(v) for v in value]
+    raise ValueError(f"invalid {key} {value!r}")
+
+
+def _number(value, cast):
+    """A frontmatter number, exactly: ``int(1.5)`` was 1, ``int(True)`` 1 and
+    ``float('nan')`` a strength (INV-14)."""
+    if isinstance(value, bool):
+        raise ValueError
+    number = cast(value) if isinstance(value, str) else value
+    if not isinstance(number, (int, float)) or not math.isfinite(number) \
+            or (cast is int and not isinstance(number, int)):
+        raise ValueError
+    return cast(number)
 
 
 def _restore_meta(meta: dict) -> dict:
@@ -98,128 +104,122 @@ def _restore_meta(meta: dict) -> dict:
     export -> import round-trip is lossless. A plain Obsidian vault without
     these keys yields an empty dict — the MemoryItem defaults stay in force."""
     out: dict = {}
-    if meta.get("tags"):
-        out["tags"] = _str_list(meta["tags"])
-    if meta.get("topics"):
-        out["topics"] = _str_list(meta["topics"])
-    if meta.get("visibility"):
-        out["visibility"] = str(meta["visibility"])
-    if meta.get("agent"):
-        out["agent"] = str(meta["agent"])
+    for key in ("strength", "visibility", "access_count", "confirmed_count",
+                "failure_count", "created_at", "updated_at"):
+        if key in meta and meta[key] is None:     # no "none" to clear to (INV-14)
+            raise ValueError(f"invalid {key} None")
+    for key in ("tags", "topics"):
+        if key in meta:
+            out[key] = _str_list(meta[key], key)
+    if meta.get("visibility") is not None:
+        out["visibility"] = str(meta["visibility"])     # "" is refused, not "private"
+    if _scalar(meta.get("agent"), "agent"):
+        out["agent"] = _scalar(meta["agent"], "agent")
     for key, cast in (
         ("strength", float), ("ttl_days", int), ("freshness_until", int),
         ("access_count", int), ("confirmed_count", int), ("failure_count", int),
-        # created_at: keep the record's original birth date on re-import so a
-        # dump→restore does not make every memory look freshly created.
-        # (updated_at is deliberately NOT restored: the import IS an update.)
-        ("created_at", int),
+        ("created_at", int), ("updated_at", int),      # a dump's age too (INV-06)
+        ("last_accessed_at", int), ("last_decayed_at", int),
     ):
-        if meta.get(key) is not None:
+        if meta.get(key) is not None:     # a value that is not one fails the file (INV-14)
             try:
-                out[key] = cast(meta[key])
-            except (TypeError, ValueError):
-                pass
+                out[key] = _number(meta[key], cast)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f"invalid {key} {meta[key]!r}") from None
     return out
 
 
 def _is_auto_memory(meta: dict) -> bool:
-    md = meta.get("metadata") or {}
-    if isinstance(md, dict) and md.get("node_type") == "memory":
-        return True
-    return False
+    """A Claude Code auto-memory: node_type, which a dump carries too, without
+    exported_at (skipping auto-memories skipped every dump, *r09 opus review*)."""
+    return (meta.get("metadata") or {}).get("node_type") == "memory" and "exported_at" not in meta
+
+
+def _is_dump(meta: dict) -> bool:
+    """A skillmem dump, which names every field: export also stamps exported_at.
+    An auto-memory is a note, or import-vault cleared what it does not state (INV-14)."""
+    return (meta.get("metadata") or {}).get("node_type") == "memory" and "exported_at" in meta
 
 
 def _title_from(meta: dict, body: str, fallback: str) -> str:
-    for key in ("title", "description", "name"):
-        v = meta.get(key)
-        if v:
-            return str(v).strip()
-    for line in body.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
-            return line.lstrip("#").strip()
-        if line:
-            return line[:120]
-    return fallback
-
-
-def _hash_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    if _is_dump(meta) and isinstance(meta.get("description"), str):
+        return meta["description"]     # exact: it is in the content hash
+    for key in ("title", "description"):
+        if key in meta:     # the key names the title: "" or null clears it (INV-14)
+            return (_scalar(meta[key], key) or "").strip()
+    if meta.get("name"):
+        return _scalar(meta["name"], "name").strip()
+    return _first_line(body, fallback)
 
 
 def _store_asset(asset: Path, assets_root: Path) -> str:
-    digest = _hash_file(asset)
+    # one read: the name is the hash of the bytes published, or an editor's
+    # save between hashing and copying filed new bytes under the old hash
+    data = asset.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
     sub = assets_root / digest[:2]
     sub.mkdir(parents=True, exist_ok=True)
-    dest = sub / (digest + asset.suffix.lower())
-    if not dest.exists():
-        shutil.copy2(asset, dest)
-    return str(dest.relative_to(assets_root.parent))
+    dest = sub / (digest + _filename_key(asset.suffix))
+    # content-addressed, so a file under this name is complete only if its bytes
+    # hash to it: a copy that died halfway left one a retry took as done (INV-16)
+    if intact_asset(dest) is None:
+        _publish(dest, data)
+    return dest.relative_to(assets_root.parent).as_posix()   # stored: one spelling on every OS
 
 
 _ATTACHMENT_RE = re.compile(r"!\[\[([^\]\n]+?)\]\]")
 
 
-def _collect_attachments(root: Path, current_dir: Path, body: str) -> list[Path]:
+def _named(pool: list[Path], parts, name: tuple[str, ...]) -> list[Path]:
+    """The paths in ``pool`` whose ``parts`` spell ``name`` in any case, the
+    exact spelling first, including canonical Unicode aliases (INV-11)."""
+    folded = tuple(_filename_key(part) for part in name)
+    return sorted((c for c in pool if tuple(_filename_key(part) for part in parts(c)) == folded),
+                  key=lambda c: parts(c) != name)
+
+
+def _collect_attachments(root: Path, current_dir: Path, body: str,
+                         listed: Iterable[str] = (), assets_root: Path | None = None) -> list[Path]:
     out: list[Path] = []
-    for match in _ATTACHMENT_RE.finditer(body):
-        target = match.group(1).split("|", 1)[0].strip()
+    # `listed`: the paths a skillmem dump records (export writes each asset
+    # under its stored name, which the body's `![[name]]` no longer matches)
+    targets = [m.group(1).split("|", 1)[0].strip() for m in _ATTACHMENT_RE.finditer(body)]
+    listed = list(listed)
+    files = sorted(root.rglob("*"))
+    store = sorted(assets_root.rglob("*")) if assets_root and listed else []
+    for n, target in enumerate([*targets, *listed]):
         if not target:
             continue
-        # Obsidian resolves attachments either next to the note or anywhere
-        # in the vault; we try both, prefer adjacent. A note is untrusted
-        # text: "../../outside.pdf" or a symlink must not pull files from
-        # beyond the vault into the assets store.
-        vault_root = root.resolve()
-        for candidate in (current_dir / target, *root.rglob(target)):
-            if not candidate.is_file() or candidate.is_symlink():
+        # Beside the note first, then anywhere in the vault, then (a listed
+        # path) the store's own copy of one the dump lost. Matched by name
+        # (_named), never by glob or by asking the file system (INV-11). A
+        # note is untrusted text: nothing from beyond the vault or the store.
+        exact, tail = Path(os.path.normpath(current_dir / target)).parts, Path(target).parts
+        for base, candidate in (*((root, c) for c in _named(files, lambda c: c.parts, exact)),
+                                *((root, c) for c in _named(files, lambda c: c.parts[-len(tail):], tail)),
+                                *((assets_root, c) for c in (_named(
+                                    store, lambda c: c.relative_to(assets_root.parent).parts, tail)
+                                    if n >= len(targets) else ()))):
+            # a stored name whose bytes hash elsewhere is not that attachment
+            if (not os.path.isfile(candidate) or os.path.islink(candidate)
+                    or intact_asset(candidate) is None):
                 continue
             try:
-                candidate.resolve().relative_to(vault_root)
+                candidate.resolve().relative_to(base.resolve())
             except ValueError:
                 continue
-            if candidate.suffix.lower() in ASSET_EXTS:
+            if _filename_key(candidate.suffix) in ASSET_EXTS:
                 out.append(candidate)
                 break
+        else:
+            raise ValueError(f"attachment {target!r} has no readable, supported copy in {root} or the store")
     return out
 
 
 @dataclass
-class VaultReport:
-    inserted: int = 0
-    updated: int = 0
-    skipped: int = 0
-    failed: list[tuple[str, str]] = None
+class VaultReport(ImportReport):
     # slugs a dump asked to retire that only the owner may retire
-    skipped_archive: list[str] = None
-
-    def __post_init__(self) -> None:
-        if self.failed is None:
-            self.failed = []
-        if self.skipped_archive is None:
-            self.skipped_archive = []
-
-
-def _iter_md(root: Path) -> Iterable[Path]:
-    # The same rule attachments and packs follow: a symlink, or anything that
-    # resolves outside the vault, is not a note — a cloned vault could carry
-    # `zshrc.md -> ~/.zshrc` and the import used to store the target's text.
-    base = root.resolve()
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink() or not path.is_file():
-            continue
-        if path.suffix.lower() not in SUPPORTED_TEXT:
-            continue
-        try:
-            if not path.resolve().is_relative_to(base):
-                continue
-        except OSError:
-            continue
-        yield path
+    skipped_archive: list[str] = field(default_factory=list)
 
 
 def import_vault(
@@ -246,107 +246,152 @@ def import_vault(
 
 def _run_import(conn, root, assets_root, kind, project_override,
                 skip_auto_memories, report, default_origin="owner") -> None:
-    for path in _iter_md(root):
+    claimed: dict[str, Path] = {}    # slug -> the file that wrote it in this run
+    for path, refused in iter_notes(root, SUPPORTED_TEXT):
+        rel = path.relative_to(root).as_posix()   # one spelling on every OS, as packs report
+        if refused:
+            report.failed.append((rel, refused))
+            continue
         try:
             # One file is all-or-nothing: a refusal partway through left the
             # row written with its lifecycle, pin and counters unapplied. tx()
             # nests as a SAVEPOINT inside the importer's own transaction.
             with S.tx(conn):
-                meta, body = _parse_md(path.read_text(encoding="utf-8"))
+                raw = path.read_bytes().decode("utf-8-sig")   # a BOM hid the frontmatter
+                meta, body = _parse_md(raw.replace("\r\n", "\n").replace("\r", "\n"))
+                if _is_dump(meta) and raw.startswith("---\n"):
+                    meta, body = _parse_md(raw)    # a dump's body keeps its line endings
                 if skip_auto_memories and _is_auto_memory(meta):
                     report.skipped += 1
                     continue
                 slug = _slug_from_meta_or_path(meta, root, path)
-                if meta.get("truncated"):
-                    # the dump carries an excerpt, not the record: importing it
-                    # would make that excerpt the record's real text and re-hash
-                    # it as approved. Skip and say so.
+                if meta.get("truncated"):     # an excerpt, not the record
                     report.failed.append(
-                        (str(path.relative_to(root)),
+                        (rel,
                          "truncated dump: body is an excerpt, not the record; "
                          "restore the body file first"))
                     continue
-                # Frontmatter project wins over the folder name; an exported dump
-                # (node_type=memory) never falls back to the folder — that folder
-                # is the kind, not a project.
-                project = project_override or (
-                    str(meta["project"]) if meta.get("project")
-                    else None if _is_auto_memory(meta)
+                if claimed.setdefault(slug, path) != path:   # `Build Steps.md`, `Build-Steps.md`
+                    report.failed.append(
+                        (rel,
+                         f"{slug!r} was already imported from "
+                         f"{claimed[slug].relative_to(root).as_posix()}; rename one"))
+                    continue
+                # Frontmatter or --project names the project, null and "" too; the
+                # folder (not a dump's: that is its kind) is only the insert default (INV-14)
+                named_project = project_override is not None or "project" in meta
+                project = (
+                    _scalar(project_override if project_override is not None
+                            else meta.get("project"), "project")
+                    if named_project or _is_dump(meta)
                     else _project_from_path(root, path)
                 )
                 title = _title_from(meta, body, slug)
                 md = meta.get("metadata") or {}
-                item_kind = kind
-                if isinstance(md, dict) and md.get("type"):
-                    item_kind = str(md["type"])
+                dump = _is_dump(meta)
+                named_kind = _file_kind(meta)
+                item_kind = kind if named_kind is None else named_kind
                 extras = _restore_meta(meta)
-                if isinstance(md, dict) and md.get("originSessionId"):
-                    extras["source_session"] = str(md["originSessionId"])
+                if _scalar(md.get("originSessionId"), "originSessionId"):
+                    extras["source_session"] = _scalar(md["originSessionId"], "originSessionId")
                 # only a dump that RECORDS the pin may change it (a pre-0.11 dump has no key)
-                pinned = bool(meta.get("pinned")) if _is_auto_memory(meta) and "pinned" in meta else None
+                pinned = None
+                if dump and "pinned" in meta:
+                    if not isinstance(meta["pinned"], bool):   # INV-14
+                        raise ValueError(f"invalid pinned {meta['pinned']!r}")
+                    pinned = bool(meta["pinned"])
+                # and every other state it records: `owner_seal: 'false'` sealed,
+                # `lifecycle: Archived` came back active, `origin: bogus` the default
+                if dump:
+                    if not isinstance(md.get("owner_seal", False), bool):
+                        raise ValueError(f"invalid owner_seal {md['owner_seal']!r}")
+                    if "origin" in md and md["origin"] not in S.ORIGINS:
+                        raise ValueError(f"invalid origin {md['origin']!r}")
+                    if meta.get("lifecycle", "active") not in ("active", "stale", "archived"):
+                        raise ValueError(f"invalid lifecycle {meta['lifecycle']!r}")
 
                 attachments: list[str] = []
-                for asset in _collect_attachments(root, path.parent, body):
-                    attachments.append(_store_asset(asset, assets_root))
+                # the key names the list; embeds stand in only without it (INV-14)
+                listed = _str_list(meta.get("attachments"), "attachments")
+                embeds = "" if "attachments" in meta or dump else body
+                for asset in _collect_attachments(root, path.parent, embeds, listed,
+                                                  assets_root):
+                    stored = _store_asset(asset, assets_root)
+                    if stored not in attachments:
+                        attachments.append(stored)
 
-                dump_origin = (str((meta.get("metadata") or {}).get("origin") or "")
-                               if _is_auto_memory(meta) else "")
+                dump_origin = str(md.get("origin") or "") if dump else ""
                 item = S.MemoryItem(
-                    # A file may lower its own origin (a pack stays a pack across an
-                    # export/import) but never raise it — see migrate._origin_from.
-                    # A skillmem dump restores its recorded origin exactly, "unknown"
-                    # included (the importer's default used to relabel it "owner").
-                    # ...and `owner` only with a person at the terminal: a file
-                    # an agent can write must not be able to declare itself the
-                    # owner's, because origin=owner sets the seal on insert and
-                    # the record is then undecayable and undeletable for good.
+                    # A dump restores its recorded origin exactly, but `owner` only
+                    # with a person at the terminal (it mints the seal); a plain
+                    # file may lower its origin, never raise it (_origin_from).
                     origin=(dump_origin if dump_origin in S.ORIGINS
                             and (dump_origin != "owner" or S.owner_present())
-                            else _migrate_origin(meta, item_kind, default_origin)),
+                            else _migrate_origin(conn, slug, meta, named_kind, kind, default_origin)),
                     slug=slug,
                     kind=item_kind,
                     title=title,
                     body=body,
                     project=project,
                     attachments=attachments,
+                    # upsert mints it only with the owner at the terminal (INV-02)
+                    owner_seal=1 if dump and md.get("owner_seal") else 0,
                     **extras,
                 )
                 existed = conn.execute(
-                    "SELECT 1 FROM memory_items WHERE slug = ?", (slug,)
+                    "SELECT lifecycle, deleted_at FROM memory_items WHERE slug = ?", (slug,)
                 ).fetchone()
+                if dump:
+                    # A dump is the whole record and names every field; earned
+                    # counters and ages only when it has them, the recency clocks
+                    # and the deadline by their key (null is "never").
+                    by_key = {"last_accessed_at", "last_decayed_at", "freshness_until"}
+                    earned = {"access_count", "confirmed_count", "failure_count",
+                              "updated_at", "created_at"} | by_key
+                    named = S.SURFACES["dump"]["names"] - earned | (earned & extras.keys()) \
+                        | (by_key & meta.keys())
+                    # a key every export writes names its field by being there: without
+                    # it `--kind` and the importer's origin are insert defaults (INV-14)
+                    named -= {f for f, key in (("kind", "type"), ("origin", "origin"),
+                                               ("source_session", "originSessionId"))
+                              if key not in md}
+                    # a dump from before the seal lets the origin it gives decide
+                    # (INV-06); the default origin a row keeps its own over does not
+                    if "owner_seal" not in md and ("origin" in md or not existed):
+                        named -= {"owner_seal"}
+                    named -= {"strength"} - meta.keys()
+                else:
+                    # a plain note names what its frontmatter states; --kind and
+                    # visibility are insert defaults
+                    named = ({"visibility", "tags", "topics", "agent", "ttl_days",
+                              "strength"} & (meta.keys() | extras.keys())) \
+                        | {k for k, v in (("kind", named_kind is not None),
+                                          ("attachments", attachments)) if v} \
+                        | {k for k, v in (("project", named_project),
+                                          ("attachments", "attachments" in meta),
+                                          ("source_session", "originSessionId" in md)) if v}
+                want_archived = dump and meta.get("lifecycle") == "archived"
+                if (dump and not want_archived and existed and existed["deleted_at"] is None
+                        and existed["lifecycle"] == "archived"):
+                    # restored before the write, which then puts back the dump's
+                    # own strength over set_archived's floor (INV-06)
+                    S.set_archived(conn, slug, False, by="import")
                 S.upsert(
-                    conn, item,
+                    conn, item, surface="dump" if dump else "note",
+                    explicit=named,
                     reason="vault import" if existed else None,
                     force=True,
-                    links=S.extract_wikilinks(body),
-                    # A skillmem dump (export.py stamps metadata.node_type) is a
-                    # restore, and a pre-0.11 dump that omitted strength meant 1.0.
-                    # A plain Obsidian note carries no strength to restore — an
-                    # ordinary sync must keep what the row earned.
-                    actor="import",     # the only appender that named no actor
-                    # a dump restore, but only with a person at the terminal: an
-                    # agent can write the .md files and then run the import
-                    owner_call=S.owner_present(),
-                    restore_strength="strength" in extras or _is_auto_memory(meta),
-                    revive=_is_auto_memory(meta),   # a dump restores a deleted slug too
-                    explicit=None,
+                    actor="import",
+                    revive=dump,        # a dump restores a deleted slug too
                 )
-                # set_archived refuses a pinned row, and the row may be pinned in
-                # the destination, in the dump, or both. Unpin, archive, then pin
-                # to whatever the dump says (or leave the row's own flag alone).
-                want_archived = _is_auto_memory(meta) and meta.get("lifecycle") == "archived"
+                # a dump of an archived record restores it archived: unpin (set_archived
+                # refuses a pinned row), archive, then pin as the dump or the row says
                 if want_archived:
                     was_pinned = conn.execute(
                         "SELECT pinned FROM memory_items WHERE slug = ? AND deleted_at IS NULL",
                         (slug,)).fetchone()
                     if was_pinned and was_pinned["pinned"]:
                         S.set_pinned(conn, slug, False)
-                    # a dump of an archived record restores it archived, or the
-                    # weekly export would quietly un-retire everything.
-                    # Storage's set_archived asks owner_present() itself; the
-                    # CLI's import-vault gate makes it True. This branch is only
-                    # reachable through the CLI, and it still calls the guarded
-                    # mutation — no allow_sealed override to pass through.
                     if S.owner_present():
                         S.set_archived(conn, slug, True, by="import")
                     else:
@@ -355,39 +400,9 @@ def _run_import(conn, root, assets_root, kind, project_override,
                         S.set_pinned(conn, slug, True)     # the row's own flag, untouched
                 if pinned is not None:
                     S.set_pinned(conn, slug, pinned)
-                # The seal is restored, never dropped: a dump of a record that was
-                # the owner's must come back sealed, or export+import is a way to
-                # launder exactly the records the seal protects. It is only ever
-                # raised here — an import cannot clear a seal the row already has.
-                # an active dump over an ARCHIVED record must restore it, or the
-                # importer and skills-restore disagree about the same dump. Only
-                # then: set_archived(False) floors strength at 0.5 and refreshes
-                # recency, so firing it for every non-archived dump reset the decay
-                # of every stale record on each weekly export/import round trip.
-                if not want_archived and _is_auto_memory(meta):
-                    current = conn.execute(
-                        "SELECT lifecycle FROM memory_items WHERE slug = ? AND deleted_at IS NULL",
-                        (slug,)).fetchone()
-                    if current and current["lifecycle"] == "archived":
-                        S.set_archived(conn, slug, False, by="import")
-                if (isinstance(md, dict) and md.get("owner_seal")
-                        and S.owner_present()):
-                    # Only with a person at the terminal. A forged dump otherwise
-                    # MINTS the seal on a record the agent wrote, and that record
-                    # is then undecayable and undeletable for good.
-                    conn.execute(
-                        "UPDATE memory_items SET owner_seal = 1 WHERE slug = ?", (slug,))
-                counters = {k: extras[k] for k in ("access_count", "confirmed_count", "failure_count")
-                            if k in extras}
-                if counters and _is_auto_memory(meta):
-                    # upsert never writes the counters (they are earned, not set);
-                    # a restore of a dump is the one place that puts them back
-                    sets = ", ".join(f"{k} = ?" for k in counters)
-                    conn.execute(f"UPDATE memory_items SET {sets} WHERE slug = ?",
-                                 (*counters.values(), slug))
                 if existed:
                     report.updated += 1
                 else:
                     report.inserted += 1
         except Exception as exc:  # noqa: BLE001
-            report.failed.append((str(path.relative_to(root)), repr(exc)))
+            report.failed.append((rel, repr(exc)))
