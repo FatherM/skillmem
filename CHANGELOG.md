@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.1
+
+Packaging only; no change in behaviour.
+
+- The plugin ships an Agent Skill, `skills/skillmem/SKILL.md`: when to recall,
+  learn and reinforce, the nine tools, and the trust model.
+- `.claude-plugin/plugin.json` no longer names `hooks/hooks.json`, which Claude
+  Code loads from its default location anyway; the same five hooks load.
+- `.claude-plugin/marketplace.json` has a description, which
+  `claude plugin validate` warned was missing.
+
 ## 0.12.0
 
 A correctness release. Several things that used to succeed quietly are now
